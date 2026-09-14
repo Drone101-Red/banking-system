@@ -1,0 +1,30 @@
+# Entorno
+.env
+.env.local
+*.env.local
+
+# Go
+backend/bin/
+backend/tmp/
+backend/server
+*.test
+*.out
+
+# Node
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+npm-debug.log*
+yarn-error.log*
+
+# Editores
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Docker / logs
+*.log
+
+# TigerBeetle datafiles (nunca se commitean)
+*.tigerbeetle
