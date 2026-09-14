@@ -3,8 +3,14 @@ package tigerbeetle
 import (
 	"fmt"
 	"strconv"
+	"time"
 
 	tb "github.com/tigerbeetle/tigerbeetle-go"
+)
+
+const (
+	maxConnectionAttempts = 5
+	connectionRetryDelay   = 2 * time.Second
 )
 
 type Client struct {
@@ -17,17 +23,39 @@ func New(address string, clusterID string) (*Client, error) {
 		return nil, fmt.Errorf("cluster ID inválido: %w", err)
 	}
 
-	client, err := tb.NewClient(
-		tb.ToUint128(id),
-		[]string{address},
-	)
+	var connectedClient *Client
+
+	err = retry(maxConnectionAttempts, connectionRetryDelay, func() error {
+		client, err := tb.NewClient(
+			tb.ToUint128(id),
+			[]string{address},
+		)
+		if err != nil {
+			return fmt.Errorf("crear cliente TigerBeetle: %w", err)
+		}
+
+		candidate := &Client{
+			client: client,
+		}
+
+		if err := candidate.Ping(); err != nil {
+			candidate.Close()
+			return err
+		}
+
+		connectedClient = candidate
+		return nil
+	})
+
 	if err != nil {
-		return nil, fmt.Errorf("crear cliente TigerBeetle: %w", err)
+		return nil, fmt.Errorf(
+			"TigerBeetle no disponible después de %d intentos: %w",
+			maxConnectionAttempts,
+			err,
+		)
 	}
 
-	return &Client{
-		client: client,
-	}, nil
+	return connectedClient, nil
 }
 
 func (c *Client) Ping() error {
