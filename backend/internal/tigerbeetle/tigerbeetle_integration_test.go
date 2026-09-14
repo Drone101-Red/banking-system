@@ -107,3 +107,71 @@ func TestCreateAccount_ConfigMismatch_Code(t *testing.T) {
 		t.Fatal("esperaba error por code distinto, obtuve nil")
 	}
 }
+
+// --- EnsureBankAccount ---
+
+func TestEnsureBankAccount_Idempotent(t *testing.T) {
+	client := newTestClient(t)
+
+	// Puede existir o no; la primera llamada la crea o la encuentra.
+	if err := client.EnsureBankAccount(); err != nil {
+		t.Fatalf("primera EnsureBankAccount: %v", err)
+	}
+	// La segunda debe ser no-op.
+	if err := client.EnsureBankAccount(); err != nil {
+		t.Fatalf("segunda EnsureBankAccount (idempotente): %v", err)
+	}
+}
+
+func TestEnsureBankAccount_Config(t *testing.T) {
+	client := newTestClient(t)
+
+	if err := client.EnsureBankAccount(); err != nil {
+		t.Fatalf("EnsureBankAccount: %v", err)
+	}
+
+	bankID := tb.ToUint128(models.BankAccountID)
+	accounts, err := client.client.LookupAccounts([]tb.Uint128{bankID})
+	if err != nil {
+		t.Fatalf("LookupAccounts: %v", err)
+	}
+	if len(accounts) != 1 {
+		t.Fatalf("esperaba 1 cuenta banco, obtuve %d", len(accounts))
+	}
+
+	acc := accounts[0]
+	if acc.Ledger != models.LedgerUSD {
+		t.Errorf("bank Ledger = %d, esperado %d", acc.Ledger, models.LedgerUSD)
+	}
+	if acc.Code != models.CodeBank {
+		t.Errorf("bank Code = %d, esperado %d", acc.Code, models.CodeBank)
+	}
+	if acc.Flags != 0 {
+		t.Errorf("bank Flags = %d, esperado 0 (sin restricción de débito)", acc.Flags)
+	}
+}
+
+func TestEnsureBankAccount_UnaffectedByUserAccounts(t *testing.T) {
+	client := newTestClient(t)
+
+	// Crear una cuenta de usuario cualquiera.
+	userID := randomAccountID(t)
+	if err := client.CreateAccount(userID, models.CodeSavings); err != nil {
+		t.Fatalf("CreateAccount usuario: %v", err)
+	}
+
+	// EnsureBankAccount no debe verse afectado.
+	if err := client.EnsureBankAccount(); err != nil {
+		t.Fatalf("EnsureBankAccount tras crear usuario: %v", err)
+	}
+
+	// Verificar que ambas cuentas coexisten correctamente.
+	bankID := tb.ToUint128(models.BankAccountID)
+	accounts, err := client.client.LookupAccounts([]tb.Uint128{bankID, userID})
+	if err != nil {
+		t.Fatalf("LookupAccounts: %v", err)
+	}
+	if len(accounts) != 2 {
+		t.Fatalf("esperaba 2 cuentas, obtuve %d", len(accounts))
+	}
+}

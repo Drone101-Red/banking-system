@@ -133,6 +133,57 @@ func (c *Client) CreateAccount(id tb.Uint128, code uint16) error {
 	return nil
 }
 
+// EnsureBankAccount garantiza que la cuenta bancaria del sistema exista.
+//
+// La cuenta banco es la contrapartida externa de depósitos y retiros.
+// Se crea con:
+//   - ID = BankAccountID (1)
+//   - Ledger = LedgerUSD
+//   - Code = CodeBank
+//   - Flags = 0  (sin restricción de débito; puede ir a saldo negativo sin límite)
+//
+// Es idempotente. Si la cuenta ya existe con la configuración esperada,
+// no hace nada. Si existe con configuración distinta, devuelve error.
+func (c *Client) EnsureBankAccount() error {
+	if c == nil || c.client == nil {
+		return fmt.Errorf("cliente TigerBeetle no inicializado")
+	}
+
+	bankID := tb.ToUint128(models.BankAccountID)
+
+	res, err := c.client.CreateAccounts([]tb.Account{{
+		ID:     bankID,
+		Ledger: models.LedgerUSD,
+		Code:   models.CodeBank,
+		Flags:  0,
+	}})
+	if err != nil {
+		return fmt.Errorf("ensure bank account %s: %w", u128Hex(bankID), err)
+	}
+
+	for _, r := range res {
+		switch r.Status {
+		case tb.AccountCreated:
+			return nil
+		case tb.AccountExists:
+			// Idempotente: ya existe con la configuración esperada.
+			return nil
+		case tb.AccountExistsWithDifferentFlags:
+			return fmt.Errorf("bank account %s exists with different flags", u128Hex(bankID))
+		case tb.AccountExistsWithDifferentLedger:
+			return fmt.Errorf("bank account %s exists with different ledger", u128Hex(bankID))
+		case tb.AccountExistsWithDifferentCode:
+			return fmt.Errorf("bank account %s exists with different code", u128Hex(bankID))
+		case tb.AccountIDMustNotBeZero:
+			return fmt.Errorf("bank account ID must not be zero")
+		default:
+			return fmt.Errorf("unexpected create bank account status: %s", r.Status)
+		}
+	}
+
+	return nil
+}
+
 // u128Hex devuelve la representación hex de un Uint128 para logs de error.
 // Evita imprimir con %v (que puede no ser legible).
 func u128Hex(id tb.Uint128) string {
