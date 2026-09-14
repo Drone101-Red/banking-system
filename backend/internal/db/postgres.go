@@ -1,33 +1,209 @@
 package db
 
 import (
-    "context"
-    "database/sql"
-    "fmt"
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"time"
 
-    _ "github.com/lib/pq"
+	"github.com/lib/pq"
+
+	"banking-system/internal/apperr"
+	"banking-system/internal/models"
 )
 
+const (
+	pgMaxOpenConns = 20
+	pgMaxIdleConns = 5
+
+	// pgConnectionAttempts y pgConnectionRetryDelay controlan el retry
+	// inicial de conexión. Postgres puede pasar el healthcheck antes de
+	// aceptar conexiones reales del cliente, por eso reintentamos.
+	pgConnectionAttempts   = 10
+	pgConnectionRetryDelay = 1 * time.Second
+)
+
+// Código PostgreSQL de violación de UNIQUE constraint.
+const pgUniqueViolation = "23505"
+
 type PostgresStore struct {
-    db *sql.DB
+	db *sql.DB
 }
 
 func NewPostgresStore(dsn string) (*PostgresStore, error) {
-    db, err := sql.Open("postgres", dsn)
-    if err != nil {
-        return nil, fmt.Errorf("abrir postgres: %w", err)
-    }
-    db.SetMaxOpenConns(20)
-    db.SetMaxIdleConns(5)
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("abrir postgres: %w", err)
+	}
+	db.SetMaxOpenConns(pgMaxOpenConns)
+	db.SetMaxIdleConns(pgMaxIdleConns)
 
-    if err := db.Ping(); err != nil {
-        return nil, fmt.Errorf("ping postgres: %w", err)
-    }
-    return &PostgresStore{db: db}, nil
+	// Retry: Postgres puede tardar unos segundos en aceptar conexiones
+	// aunque el healthcheck ya haya dado verde.
+	var lastErr error
+	for attempt := 1; attempt <= pgConnectionAttempts; attempt++ {
+		if err := db.Ping(); err == nil {
+			return &PostgresStore{db: db}, nil
+		} else {
+			lastErr = err
+		}
+
+		if attempt < pgConnectionAttempts {
+			time.Sleep(pgConnectionRetryDelay)
+		}
+	}
+
+	_ = db.Close()
+	return nil, fmt.Errorf(
+		"postgres no disponible después de %d intentos: %w",
+		pgConnectionAttempts,
+		lastErr,
+	)
 }
 
 func (s *PostgresStore) Close() error { return s.db.Close() }
 
 func (s *PostgresStore) Ping(ctx context.Context) error {
-    return s.db.PingContext(ctx)
+	return s.db.PingContext(ctx)
+}
+
+// CreateUserPending inserta un usuario nuevo con status PENDING.
+//
+// Si el email o el tb_account_id ya existen, devuelve apperr.Conflict
+// con el código correspondiente. La restricción UNIQUE de PostgreSQL
+// es la autoridad final contra duplicados.
+func (s *PostgresStore) CreateUserPending(ctx context.Context, u *models.User) error {
+	const q = `
+		INSERT INTO users (email, password_hash, full_name, tb_account_id, status)
+		VALUES ($1, $2, $3, $4, $5)
+		RETURNING id, created_at, updated_at`
+
+	err := s.db.QueryRowContext(ctx, q,
+		u.Email,
+		u.PasswordHash,
+		u.FullName,
+		u.TBAccountID,
+		models.StatusPending,
+	).Scan(&u.ID, &u.CreatedAt, &u.UpdatedAt)
+
+	if err != nil {
+		var pqErr *pq.Error
+		if errors.As(err, &pqErr) && string(pqErr.Code) == pgUniqueViolation {
+			// Distinguimos por nombre de constraint para dar un código útil.
+			switch pqErr.Constraint {
+			case "users_email_key":
+				return apperr.Conflict("EMAIL_EXISTS", "El email ya está registrado")
+			case "users_tb_account_id_key":
+				return apperr.Conflict("TB_ACCOUNT_ID_COLLISION", "Colisión de identificador financiero")
+			default:
+				return apperr.Conflict("UNIQUE_VIOLATION", "Recurso duplicado")
+			}
+		}
+		return apperr.Internal(fmt.Errorf("create user pending: %w", err))
+	}
+
+	u.Status = models.StatusPending
+	return nil
+}
+
+// GetUserByEmail busca un usuario por email.
+// Devuelve apperr.NotFound si no existe.
+func (s *PostgresStore) GetUserByEmail(ctx context.Context, email string) (*models.User, error) {
+	const q = `
+		SELECT id, email, password_hash, full_name, tb_account_id,
+		       status, created_at, updated_at
+		FROM users
+		WHERE email = $1`
+
+	return s.scanUser(s.db.QueryRowContext(ctx, q, email))
+}
+
+// GetUserByID busca un usuario por UUID.
+// Devuelve apperr.NotFound si no existe.
+func (s *PostgresStore) GetUserByID(ctx context.Context, id string) (*models.User, error) {
+	const q = `
+		SELECT id, email, password_hash, full_name, tb_account_id,
+		       status, created_at, updated_at
+		FROM users
+		WHERE id = $1`
+
+	return s.scanUser(s.db.QueryRowContext(ctx, q, id))
+}
+
+// UpdateUserStatusActive marca un usuario PENDING como ACTIVE.
+//
+// Es idempotente: si el usuario ya está ACTIVE (otra ejecución lo
+// procesó antes), el UPDATE afecta 0 filas y no devuelve error.
+//
+// Devuelve apperr.NotFound solo si el id no existe en absoluto.
+func (s *PostgresStore) UpdateUserStatusActive(ctx context.Context, id string) error {
+	const q = `
+		UPDATE users
+		SET status = $1,
+		    updated_at = NOW()
+		WHERE id = $2 AND status = $3`
+
+	res, err := s.db.ExecContext(ctx, q, models.StatusActive, id, models.StatusPending)
+	if err != nil {
+		return apperr.Internal(fmt.Errorf("update user status active: %w", err))
+	}
+
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return apperr.Internal(fmt.Errorf("rows affected: %w", err))
+	}
+
+	if rows == 0 {
+		// Puede ser porque:
+		//   a) El usuario ya está ACTIVE → idempotencia OK, no error.
+		//   b) El usuario no existe → error real.
+		// Distinguimos con un lookup.
+		exists, err := s.userExists(ctx, id)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return apperr.NotFound("USER_NOT_FOUND", "Usuario no encontrado")
+		}
+		// Existe pero ya estaba ACTIVE → idempotente, no error.
+	}
+
+	return nil
+}
+
+// userExists devuelve true si existe un usuario con el ID dado.
+func (s *PostgresStore) userExists(ctx context.Context, id string) (bool, error) {
+	const q = `SELECT 1 FROM users WHERE id = $1`
+	var dummy int
+	err := s.db.QueryRowContext(ctx, q, id).Scan(&dummy)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, apperr.Internal(fmt.Errorf("user exists: %w", err))
+	}
+	return true, nil
+}
+
+// scanUser escanea una fila de users a un models.User.
+func (s *PostgresStore) scanUser(row *sql.Row) (*models.User, error) {
+	var u models.User
+	err := row.Scan(
+		&u.ID,
+		&u.Email,
+		&u.PasswordHash,
+		&u.FullName,
+		&u.TBAccountID,
+		&u.Status,
+		&u.CreatedAt,
+		&u.UpdatedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, apperr.NotFound("USER_NOT_FOUND", "Usuario no encontrado")
+	}
+	if err != nil {
+		return nil, apperr.Internal(fmt.Errorf("scan user: %w", err))
+	}
+	return &u, nil
 }
