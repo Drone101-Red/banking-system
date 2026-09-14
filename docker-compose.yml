@@ -35,6 +35,25 @@ services:
       retries: 10
       start_period: 5s
 
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: banking-backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: banking
+      POSTGRES_USER: banking_user
+      POSTGRES_PASSWORD: secret123
+      APP_PORT: 8080
+      APP_ENV: development
+    ports:
+      - "8080:8080"
+
 volumes:
   postgres_data:
   tb_data:
