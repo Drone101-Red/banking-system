@@ -39,6 +39,8 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
+    security_opt:
+      - seccomp=unconfined
     container_name: banking-backend
     depends_on:
       postgres:
@@ -51,6 +53,8 @@ services:
       POSTGRES_PASSWORD: secret123
       APP_PORT: 8080
       APP_ENV: development
+      TB_ADDRESS: ${TB_ADDRESS}
+      TB_CLUSTER_ID: ${TB_CLUSTER_ID}
     ports:
       - "8080:8080"
 
