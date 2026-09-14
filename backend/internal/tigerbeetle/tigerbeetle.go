@@ -13,6 +13,12 @@ import (
 const (
 	maxConnectionAttempts = 5
 	connectionRetryDelay  = 2 * time.Second
+
+	// accountLookupTimeout acota el tiempo máximo que esperamos por un
+	// LookupAccounts. El cliente TigerBeetle no acepta context.Context y
+	// no tiene timeout configurable, así que el timeout se aplica desde
+	// afuera, con una goroutine y un select sobre time.After.
+	accountLookupTimeout = 2 * time.Second
 )
 
 type Client struct {
@@ -78,6 +84,39 @@ func (c *Client) Close() {
 	}
 
 	c.client.Close()
+}
+
+// AccountExists devuelve true si la cuenta con el ID dado existe en TB.
+//
+// Aplica un timeout porque el cliente TigerBeetle no respeta context.Context
+// y no tiene timeout configurable. Si TB no responde en accountLookupTimeout,
+// devuelve error sin bloquear al caller.
+func (c *Client) AccountExists(id tb.Uint128) (bool, error) {
+	if c == nil || c.client == nil {
+		return false, fmt.Errorf("cliente TigerBeetle no inicializado")
+	}
+
+	type result struct {
+		exists bool
+		err    error
+	}
+	ch := make(chan result, 1)
+
+	go func() {
+		accounts, err := c.client.LookupAccounts([]tb.Uint128{id})
+		if err != nil {
+			ch <- result{false, fmt.Errorf("lookup account %s: %w", u128Hex(id), err)}
+			return
+		}
+		ch <- result{len(accounts) > 0, nil}
+	}()
+
+	select {
+	case r := <-ch:
+		return r.exists, r.err
+	case <-time.After(accountLookupTimeout):
+		return false, fmt.Errorf("lookup account %s: timeout after %v", u128Hex(id), accountLookupTimeout)
+	}
 }
 
 // CreateAccount crea una cuenta de usuario con la configuración estándar:

@@ -56,7 +56,6 @@ func TestCreateAccount_New(t *testing.T) {
 		t.Fatalf("CreateAccount (nueva): %v", err)
 	}
 
-	// Verificar que existe con la config correcta.
 	accounts, err := client.client.LookupAccounts([]tb.Uint128{id})
 	if err != nil {
 		t.Fatalf("LookupAccounts: %v", err)
@@ -101,23 +100,18 @@ func TestCreateAccount_ConfigMismatch_Code(t *testing.T) {
 		t.Fatalf("primera CreateAccount: %v", err)
 	}
 
-	// Intentar crear la misma cuenta con code distinto.
 	err := client.CreateAccount(id, models.CodeBank)
 	if err == nil {
 		t.Fatal("esperaba error por code distinto, obtuve nil")
 	}
 }
 
-// --- EnsureBankAccount ---
-
 func TestEnsureBankAccount_Idempotent(t *testing.T) {
 	client := newTestClient(t)
 
-	// Puede existir o no; la primera llamada la crea o la encuentra.
 	if err := client.EnsureBankAccount(); err != nil {
 		t.Fatalf("primera EnsureBankAccount: %v", err)
 	}
-	// La segunda debe ser no-op.
 	if err := client.EnsureBankAccount(); err != nil {
 		t.Fatalf("segunda EnsureBankAccount (idempotente): %v", err)
 	}
@@ -147,25 +141,22 @@ func TestEnsureBankAccount_Config(t *testing.T) {
 		t.Errorf("bank Code = %d, esperado %d", acc.Code, models.CodeBank)
 	}
 	if acc.Flags != 0 {
-		t.Errorf("bank Flags = %d, esperado 0 (sin restricción de débito)", acc.Flags)
+		t.Errorf("bank Flags = %d, esperado 0", acc.Flags)
 	}
 }
 
 func TestEnsureBankAccount_UnaffectedByUserAccounts(t *testing.T) {
 	client := newTestClient(t)
 
-	// Crear una cuenta de usuario cualquiera.
 	userID := randomAccountID(t)
 	if err := client.CreateAccount(userID, models.CodeSavings); err != nil {
 		t.Fatalf("CreateAccount usuario: %v", err)
 	}
 
-	// EnsureBankAccount no debe verse afectado.
 	if err := client.EnsureBankAccount(); err != nil {
 		t.Fatalf("EnsureBankAccount tras crear usuario: %v", err)
 	}
 
-	// Verificar que ambas cuentas coexisten correctamente.
 	bankID := tb.ToUint128(models.BankAccountID)
 	accounts, err := client.client.LookupAccounts([]tb.Uint128{bankID, userID})
 	if err != nil {
@@ -173,5 +164,55 @@ func TestEnsureBankAccount_UnaffectedByUserAccounts(t *testing.T) {
 	}
 	if len(accounts) != 2 {
 		t.Fatalf("esperaba 2 cuentas, obtuve %d", len(accounts))
+	}
+}
+
+// --- AccountExists ---
+
+func TestAccountExists_True(t *testing.T) {
+	client := newTestClient(t)
+
+	id := randomAccountID(t)
+	if err := client.CreateAccount(id, models.CodeSavings); err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+
+	exists, err := client.AccountExists(id)
+	if err != nil {
+		t.Fatalf("AccountExists: %v", err)
+	}
+	if !exists {
+		t.Fatal("esperaba exists=true, obtuve false")
+	}
+}
+
+func TestAccountExists_False(t *testing.T) {
+	client := newTestClient(t)
+
+	id := randomAccountID(t)
+
+	exists, err := client.AccountExists(id)
+	if err != nil {
+		t.Fatalf("AccountExists: %v", err)
+	}
+	if exists {
+		t.Fatal("esperaba exists=false para cuenta inexistente, obtuve true")
+	}
+}
+
+func TestAccountExists_BankAccount(t *testing.T) {
+	client := newTestClient(t)
+
+	if err := client.EnsureBankAccount(); err != nil {
+		t.Fatalf("EnsureBankAccount: %v", err)
+	}
+
+	bankID := tb.ToUint128(models.BankAccountID)
+	exists, err := client.AccountExists(bankID)
+	if err != nil {
+		t.Fatalf("AccountExists: %v", err)
+	}
+	if !exists {
+		t.Fatal("esperaba que la cuenta banco exista, obtuve false")
 	}
 }
