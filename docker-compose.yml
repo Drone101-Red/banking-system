@@ -17,5 +17,24 @@ services:
       timeout: 5s
       retries: 10
 
+  tigerbeetle:
+    image: ghcr.io/tigerbeetle/tigerbeetle:0.17.9
+    container_name: banking-tigerbeetle
+    security_opt:
+      - seccomp=unconfined
+    entrypoint: ["/bin/sh", "/tb-entrypoint.sh"]
+    volumes:
+      - tb_data:/data
+      - ./scripts/tb-entrypoint.sh:/tb-entrypoint.sh:ro
+    ports:
+      - "3000:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "pidof tigerbeetle > /dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
 volumes:
   postgres_data:
+  tb_data:
