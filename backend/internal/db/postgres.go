@@ -66,6 +66,8 @@ func (s *PostgresStore) Ping(ctx context.Context) error {
 	return s.db.PingContext(ctx)
 }
 
+// --- Users ---
+
 // CreateUserPending inserta un usuario nuevo con status PENDING.
 func (s *PostgresStore) CreateUserPending(ctx context.Context, u *models.User) error {
 	const q = `
@@ -123,9 +125,6 @@ func (s *PostgresStore) GetUserByID(ctx context.Context, id string) (*models.Use
 }
 
 // UpdateUserStatusActive marca un usuario PENDING como ACTIVE.
-//
-// Es idempotente: si el usuario ya está ACTIVE (otra ejecución lo
-// procesó antes), el UPDATE afecta 0 filas y no devuelve error.
 func (s *PostgresStore) UpdateUserStatusActive(ctx context.Context, id string) error {
 	const q = `
 		UPDATE users
@@ -151,17 +150,12 @@ func (s *PostgresStore) UpdateUserStatusActive(ctx context.Context, id string) e
 		if !exists {
 			return apperr.NotFound("USER_NOT_FOUND", "Usuario no encontrado")
 		}
-		// Existe pero ya estaba ACTIVE → idempotente, no error.
 	}
 
 	return nil
 }
 
-// ListPendingUsers devuelve hasta `limit` usuarios con status PENDING,
-// ordenados por created_at (los más antiguos primero).
-//
-// Se usa desde el reconciliador. El orden garantiza que los usuarios
-// que llevan más tiempo esperando se procesen primero.
+// ListPendingUsers devuelve hasta `limit` usuarios con status PENDING.
 func (s *PostgresStore) ListPendingUsers(ctx context.Context, limit int) ([]*models.User, error) {
 	const q = `
 		SELECT id, email, password_hash, full_name, tb_account_id,
@@ -199,6 +193,95 @@ func (s *PostgresStore) ListPendingUsers(ctx context.Context, limit int) ([]*mod
 	}
 	return out, nil
 }
+
+// --- Transactions log ---
+
+// InsertTransactionLog guarda un índice de la transferencia para el
+// historial. La verdad financiera está en TigerBeetle.
+//
+// Es idempotente: si el tb_transfer_id ya existe (UNIQUE constraint),
+// el INSERT usa ON CONFLICT DO NOTHING.
+func (s *PostgresStore) InsertTransactionLog(ctx context.Context, t *models.Transaction) error {
+	const q = `
+		INSERT INTO transactions_log
+		    (tb_transfer_id, debit_account_id, credit_account_id, amount_cents, code)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (tb_transfer_id) DO NOTHING`
+
+	_, err := s.db.ExecContext(ctx, q,
+		t.TBTransferID,
+		t.DebitAccountID,
+		t.CreditAccountID,
+		t.AmountCents,
+		t.Code,
+	)
+	if err != nil {
+		return apperr.Internal(fmt.Errorf("insert transaction log: %w", err))
+	}
+	return nil
+}
+
+// ListTransactions devuelve el historial paginado que involucra a
+// tbAccountID (como debit o credit). Ordenado por created_at DESC.
+//
+// Devuelve (transacciones, total, error). El total es para que el
+// handler pueda calcular páginas.
+func (s *PostgresStore) ListTransactions(
+	ctx context.Context,
+	tbAccountID []byte,
+	limit, offset int,
+) ([]*models.Transaction, int, error) {
+	// Total para paginación
+	const countQ = `
+		SELECT COUNT(*)
+		FROM transactions_log
+		WHERE debit_account_id = $1 OR credit_account_id = $1`
+
+	var total int
+	if err := s.db.QueryRowContext(ctx, countQ, tbAccountID).Scan(&total); err != nil {
+		return nil, 0, apperr.Internal(fmt.Errorf("count transactions: %w", err))
+	}
+
+	// Página
+	const listQ = `
+		SELECT id, tb_transfer_id, debit_account_id, credit_account_id,
+		       amount_cents, code, created_at
+		FROM transactions_log
+		WHERE debit_account_id = $1 OR credit_account_id = $1
+		ORDER BY created_at DESC
+		LIMIT $2 OFFSET $3`
+
+	rows, err := s.db.QueryContext(ctx, listQ, tbAccountID, limit, offset)
+	if err != nil {
+		return nil, 0, apperr.Internal(fmt.Errorf("list transactions: %w", err))
+	}
+	defer rows.Close()
+
+	var out []*models.Transaction
+	for rows.Next() {
+		var t models.Transaction
+		if err := rows.Scan(
+			&t.ID,
+			&t.TBTransferID,
+			&t.DebitAccountID,
+			&t.CreditAccountID,
+			&t.AmountCents,
+			&t.Code,
+			&t.CreatedAt,
+		); err != nil {
+			return nil, 0, apperr.Internal(fmt.Errorf("scan transaction: %w", err))
+		}
+		t.FillHex()
+		out = append(out, &t)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, apperr.Internal(fmt.Errorf("rows error: %w", err))
+	}
+
+	return out, total, nil
+}
+
+// --- Helpers ---
 
 // userExists devuelve true si existe un usuario con el ID dado.
 func (s *PostgresStore) userExists(ctx context.Context, id string) (bool, error) {
