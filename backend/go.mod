@@ -1,6 +1,8 @@
 module banking-system
 
-go 1.26.0
+go 1.24.0
+
+toolchain go1.24.4
 
 require github.com/lib/pq v1.12.3
 
@@ -9,4 +11,4 @@ require (
 	github.com/tigerbeetle/tigerbeetle-go v0.17.9
 )
 
-require golang.org/x/crypto v0.57.0
+require golang.org/x/crypto v0.47.0

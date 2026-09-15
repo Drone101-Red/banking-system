@@ -15,6 +15,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	tb "github.com/tigerbeetle/tigerbeetle-go"
 
+	"banking-system/internal/auth"
 	"banking-system/internal/db"
 	"banking-system/internal/models"
 	"banking-system/internal/tigerbeetle"
@@ -54,12 +55,14 @@ func main() {
 	log.Println("✅ TigerBeetle conectado")
 
 	// Bootstrap de la infraestructura financiera.
-	// Si falla, el backend no arranca: sin cuenta banco no hay operaciones
-	// financieras posibles.
 	if err := tbClient.EnsureBankAccount(); err != nil {
 		log.Fatalf("❌ Cuenta banco: %v", err)
 	}
 	log.Println("✅ Cuenta banco verificada (ID=1)")
+
+	// Wiring de servicios
+	authService := auth.NewService(pg, tbClient)
+	authHandler := auth.NewHandler(authService)
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
@@ -69,6 +72,11 @@ func main() {
 	r.Use(middleware.Timeout(10 * time.Second))
 
 	r.Get("/health", healthHandler(pg, tbClient))
+
+	// Rutas de auth
+	r.Route("/api/auth", func(r chi.Router) {
+		r.Post("/register", authHandler.RegisterHandler)
+	})
 
 	srv := &http.Server{
 		Addr:         ":" + port,
@@ -97,12 +105,6 @@ func main() {
 	}
 }
 
-// healthHandler devuelve el estado de PostgreSQL y TigerBeetle.
-//
-// Para TigerBeetle no basta con Nop(): una caída del servidor no siempre
-// se refleja en Nop() de inmediato. Por eso verificamos que la cuenta banco
-// exista con un LookupAccounts real. Si TB está caído, el lookup falla y el
-// healthcheck devuelve degraded.
 func healthHandler(pg *db.PostgresStore, tbClient *tigerbeetle.Client) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
