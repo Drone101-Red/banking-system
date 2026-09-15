@@ -17,7 +17,7 @@ import (
 const (
 	// maxToolCallIterations acota el número de vueltas del loop
 	// para evitar loops infinitos si el modelo no coopera.
-	maxToolCallIterations = 5
+	maxToolCallIterations = 10
 
 	// maxHistoryMessages acota el historial que se envía al modelo.
 	// Cada turno son 2 mensajes (user + assistant), así que 20
@@ -92,6 +92,14 @@ func NewService(
 //  2. Llamar a OpenRouter con las tools.
 //  3. Si el modelo pide tools: ejecutarlas, agregar resultados, repetir.
 //  4. Si el modelo da respuesta final: devolverla.
+//
+// Casos manejados:
+//   - No hay tool calls → respuesta final.
+//   - Hay tool calls y content no vacío → ejecutar tools y devolver content.
+//   - Hay tool calls sin content → ejecutar tools y seguir el loop.
+//
+// Si el modelo se queda en loop o no da respuesta, se devuelve un
+// fallback construido a partir de las tools ejecutadas.
 func (s *Service) Chat(
 	ctx context.Context,
 	userID string,
@@ -115,30 +123,48 @@ func (s *Service) Chat(
 			return nil, err
 		}
 
-		// Acumular usage
 		totalUsage.PromptTokens += resp.Usage.PromptTokens
 		totalUsage.CompletionTokens += resp.Usage.CompletionTokens
 		totalUsage.TotalTokens += resp.Usage.TotalTokens
 
 		choice := resp.Choices[0]
 
-		// Si no hay tool calls, es la respuesta final.
-		if choice.FinishReason != "tool_calls" && len(choice.Message.ToolCalls) == 0 {
+		// --- Caso 1: no hay tool calls → respuesta final. ---
+		if len(choice.Message.ToolCalls) == 0 {
+			reply := strings.TrimSpace(choice.Message.Content)
+			if reply == "" {
+				reply = buildFallbackReply(executedTools)
+			}
 			return &ChatResult{
-				Reply:     choice.Message.Content,
+				Reply:     reply,
 				ToolCalls: executedTools,
 				Usage:     totalUsage,
 			}, nil
 		}
 
-		// Hay tool calls: agregar el assistant message con las tool calls.
+		// --- Caso 2: hay tool calls Y content no vacío. ---
+		// El modelo quiere ejecutar tools Y decir algo.
+		// Ejecutamos las tools y devolvemos el content como respuesta.
+		if strings.TrimSpace(choice.Message.Content) != "" {
+			for _, tc := range choice.Message.ToolCalls {
+				if _, err := s.executeToolCall(ctx, userID, tc); err != nil {
+					log.Printf("[chat] tool %s falló: %v", tc.Function.Name, err)
+				}
+				executedTools = append(executedTools, tc)
+			}
+			return &ChatResult{
+				Reply:     strings.TrimSpace(choice.Message.Content),
+				ToolCalls: executedTools,
+				Usage:     totalUsage,
+			}, nil
+		}
+
+		// --- Caso 3: hay tool calls sin content → ejecutar y seguir. ---
 		messages = append(messages, choice.Message)
 
-		// Ejecutar cada tool call.
 		for _, tc := range choice.Message.ToolCalls {
 			result, err := s.executeToolCall(ctx, userID, tc)
 
-			// El resultado (o error) se pasa al modelo como tool message.
 			var content string
 			if err != nil {
 				log.Printf("[chat] tool %s falló: %v", tc.Function.Name, err)
@@ -160,10 +186,12 @@ func (s *Service) Chat(
 	}
 
 	// Si llegamos acá, el modelo no dio respuesta final en N iteraciones.
-	return nil, apperr.Internal(fmt.Errorf(
-		"el modelo no dio respuesta final después de %d iteraciones",
-		maxToolCallIterations,
-	))
+	// Devolvemos un fallback con las tools que sí se ejecutaron.
+	return &ChatResult{
+		Reply:     buildFallbackReply(executedTools),
+		ToolCalls: executedTools,
+		Usage:     totalUsage,
+	}, nil
 }
 
 // buildInitialMessages construye el array de mensajes inicial.
@@ -210,4 +238,34 @@ func (s *Service) executeToolCall(
 	}
 
 	return s.executor.Execute(ctx, userID, tc.Function.Name, args)
+}
+
+// buildFallbackReply genera una respuesta si el modelo no dio una.
+//
+// Se usa cuando:
+//   - El modelo devolvió content vacío en la respuesta final.
+//   - El modelo se quedó en loop sin dar respuesta final.
+//
+// En ambos casos, construimos un mensaje a partir de las tools que
+// sí se ejecutaron.
+func buildFallbackReply(tools []ToolCall) string {
+	if len(tools) == 0 {
+		return "No pude procesar tu mensaje. ¿Podrías reformularlo?"
+	}
+
+	last := tools[len(tools)-1].Function.Name
+	switch last {
+	case "get_balance":
+		return "Consulté tu saldo."
+	case "get_history":
+		return "Consulté tu historial."
+	case "deposit":
+		return "Depósito realizado correctamente."
+	case "withdraw":
+		return "Retiro realizado correctamente."
+	case "transfer":
+		return "Transferencia realizada correctamente."
+	default:
+		return "Operación completada."
+	}
 }

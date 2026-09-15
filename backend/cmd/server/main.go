@@ -18,6 +18,7 @@ import (
 
 	"banking-system/internal/account"
 	"banking-system/internal/auth"
+	"banking-system/internal/chat"
 	"banking-system/internal/db"
 	"banking-system/internal/models"
 	"banking-system/internal/recovery"
@@ -45,6 +46,12 @@ func main() {
 	if len(jwtSecret) < 32 {
 		log.Fatal("❌ JWT_SECRET debe tener al menos 32 caracteres")
 	}
+
+	openRouterKey := getEnv("OPENROUTER_API_KEY", "")
+	if openRouterKey == "" {
+		log.Fatal("❌ OPENROUTER_API_KEY no configurada. Definir en .env")
+	}
+	openRouterModel := getEnv("OPENROUTER_MODEL", "openrouter/free")
 
 	dsn := fmt.Sprintf(
 		"host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
@@ -85,8 +92,14 @@ func main() {
 
 	txnService := transactions.NewService(pg, tbClient)
 	txnHandler := transactions.NewHandler(txnService)
+
 	acctService := account.NewService(pg, tbClient)
 	acctHandler := account.NewHandler(acctService)
+
+	// Wiring de chat
+	openRouterClient := chat.NewOpenRouterClient(openRouterKey, openRouterModel)
+	chatService := chat.NewService(pg, acctService, txnService, openRouterClient)
+	chatHandler := chat.NewHandler(chatService)
 
 	// Reconciliador
 	reconciler := recovery.NewReconciler(pg, tbClient)
@@ -97,9 +110,10 @@ func main() {
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
-	r.Use(middleware.Timeout(10 * time.Second))
+	r.Use(middleware.Timeout(30 * time.Second))
 
 	r.Get("/health", healthHandler(pg, tbClient))
+
 	// Rutas de auth
 	r.Route("/api/auth", func(r chi.Router) {
 		r.Post("/register", authHandler.RegisterHandler)
@@ -127,11 +141,18 @@ func main() {
 		r.Get("/api/account", acctHandler.InfoHandler)
 		r.Get("/api/account/balance", acctHandler.BalanceHandler)
 	})
+
+	// Ruta de chat (requiere JWT)
+	r.Group(func(r chi.Router) {
+		r.Use(auth.RequireAuth(jwtSecret))
+		r.Post("/api/chat", chatHandler.ChatHandler)
+	})
+
 	srv := &http.Server{
 		Addr:         ":" + port,
 		Handler:      r,
 		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 15 * time.Second,
+		WriteTimeout: 90 * time.Second, // el chat puede tardar (LLM)
 		IdleTimeout:  60 * time.Second,
 	}
 
@@ -147,7 +168,6 @@ func main() {
 	<-quit
 	log.Println("🛑 Cerrando...")
 
-	// Cancelar servicios de background.
 	rootCancel()
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

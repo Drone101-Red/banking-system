@@ -62,8 +62,11 @@ services:
       APP_ENV: development
       TB_ADDRESS: ${TB_ADDRESS}
       TB_CLUSTER_ID: ${TB_CLUSTER_ID}
-      JWT_SECRET: 934d21db7326f4f86164171b2d523f33f0da6e64488a3efe8d542288767e3aa3                    # ← NUEVA
-      JWT_EXPIRY_HOURS: ${JWT_EXPIRY_HOURS:-24}    # ← NUEVA (con default)
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_EXPIRY_HOURS: ${JWT_EXPIRY_HOURS:-24}
+      RECONCILE_INTERVAL_MINUTES: ${RECONCILE_INTERVAL_MINUTES:-5}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-openrouter/free}
     ports:
       - "8080:8080"
     networks:
