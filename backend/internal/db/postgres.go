@@ -39,8 +39,6 @@ func NewPostgresStore(dsn string) (*PostgresStore, error) {
 	db.SetMaxOpenConns(pgMaxOpenConns)
 	db.SetMaxIdleConns(pgMaxIdleConns)
 
-	// Retry: Postgres puede tardar unos segundos en aceptar conexiones
-	// aunque el healthcheck ya haya dado verde.
 	var lastErr error
 	for attempt := 1; attempt <= pgConnectionAttempts; attempt++ {
 		if err := db.Ping(); err == nil {
@@ -69,10 +67,6 @@ func (s *PostgresStore) Ping(ctx context.Context) error {
 }
 
 // CreateUserPending inserta un usuario nuevo con status PENDING.
-//
-// Si el email o el tb_account_id ya existen, devuelve apperr.Conflict
-// con el código correspondiente. La restricción UNIQUE de PostgreSQL
-// es la autoridad final contra duplicados.
 func (s *PostgresStore) CreateUserPending(ctx context.Context, u *models.User) error {
 	const q = `
 		INSERT INTO users (email, password_hash, full_name, tb_account_id, status)
@@ -90,7 +84,6 @@ func (s *PostgresStore) CreateUserPending(ctx context.Context, u *models.User) e
 	if err != nil {
 		var pqErr *pq.Error
 		if errors.As(err, &pqErr) && string(pqErr.Code) == pgUniqueViolation {
-			// Distinguimos por nombre de constraint para dar un código útil.
 			switch pqErr.Constraint {
 			case "users_email_key":
 				return apperr.Conflict("EMAIL_EXISTS", "El email ya está registrado")
@@ -108,7 +101,6 @@ func (s *PostgresStore) CreateUserPending(ctx context.Context, u *models.User) e
 }
 
 // GetUserByEmail busca un usuario por email.
-// Devuelve apperr.NotFound si no existe.
 func (s *PostgresStore) GetUserByEmail(ctx context.Context, email string) (*models.User, error) {
 	const q = `
 		SELECT id, email, password_hash, full_name, tb_account_id,
@@ -120,7 +112,6 @@ func (s *PostgresStore) GetUserByEmail(ctx context.Context, email string) (*mode
 }
 
 // GetUserByID busca un usuario por UUID.
-// Devuelve apperr.NotFound si no existe.
 func (s *PostgresStore) GetUserByID(ctx context.Context, id string) (*models.User, error) {
 	const q = `
 		SELECT id, email, password_hash, full_name, tb_account_id,
@@ -135,8 +126,6 @@ func (s *PostgresStore) GetUserByID(ctx context.Context, id string) (*models.Use
 //
 // Es idempotente: si el usuario ya está ACTIVE (otra ejecución lo
 // procesó antes), el UPDATE afecta 0 filas y no devuelve error.
-//
-// Devuelve apperr.NotFound solo si el id no existe en absoluto.
 func (s *PostgresStore) UpdateUserStatusActive(ctx context.Context, id string) error {
 	const q = `
 		UPDATE users
@@ -155,10 +144,6 @@ func (s *PostgresStore) UpdateUserStatusActive(ctx context.Context, id string) e
 	}
 
 	if rows == 0 {
-		// Puede ser porque:
-		//   a) El usuario ya está ACTIVE → idempotencia OK, no error.
-		//   b) El usuario no existe → error real.
-		// Distinguimos con un lookup.
 		exists, err := s.userExists(ctx, id)
 		if err != nil {
 			return err
@@ -170,6 +155,49 @@ func (s *PostgresStore) UpdateUserStatusActive(ctx context.Context, id string) e
 	}
 
 	return nil
+}
+
+// ListPendingUsers devuelve hasta `limit` usuarios con status PENDING,
+// ordenados por created_at (los más antiguos primero).
+//
+// Se usa desde el reconciliador. El orden garantiza que los usuarios
+// que llevan más tiempo esperando se procesen primero.
+func (s *PostgresStore) ListPendingUsers(ctx context.Context, limit int) ([]*models.User, error) {
+	const q = `
+		SELECT id, email, password_hash, full_name, tb_account_id,
+		       status, created_at, updated_at
+		FROM users
+		WHERE status = $1
+		ORDER BY created_at ASC
+		LIMIT $2`
+
+	rows, err := s.db.QueryContext(ctx, q, models.StatusPending, limit)
+	if err != nil {
+		return nil, apperr.Internal(fmt.Errorf("list pending users: %w", err))
+	}
+	defer rows.Close()
+
+	var out []*models.User
+	for rows.Next() {
+		var u models.User
+		if err := rows.Scan(
+			&u.ID,
+			&u.Email,
+			&u.PasswordHash,
+			&u.FullName,
+			&u.TBAccountID,
+			&u.Status,
+			&u.CreatedAt,
+			&u.UpdatedAt,
+		); err != nil {
+			return nil, apperr.Internal(fmt.Errorf("scan pending user: %w", err))
+		}
+		out = append(out, &u)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, apperr.Internal(fmt.Errorf("rows error: %w", err))
+	}
+	return out, nil
 }
 
 // userExists devuelve true si existe un usuario con el ID dado.

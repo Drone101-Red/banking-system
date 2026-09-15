@@ -19,6 +19,7 @@ import (
 	"banking-system/internal/auth"
 	"banking-system/internal/db"
 	"banking-system/internal/models"
+	"banking-system/internal/recovery"
 	"banking-system/internal/tigerbeetle"
 )
 
@@ -34,6 +35,7 @@ func main() {
 
 	jwtSecret := getEnv("JWT_SECRET", "")
 	jwtExpiryHours := getEnvInt("JWT_EXPIRY_HOURS", 24)
+	reconcileInterval := getEnvInt("RECONCILE_INTERVAL_MINUTES", 5)
 
 	if jwtSecret == "" {
 		log.Fatal("❌ JWT_SECRET no configurado. Definir en .env")
@@ -70,10 +72,18 @@ func main() {
 	}
 	log.Println("✅ Cuenta banco verificada (ID=1)")
 
+	// Context raíz para servicios de background. Se cancela al shutdown.
+	rootCtx, rootCancel := context.WithCancel(context.Background())
+	defer rootCancel()
+
 	// Wiring de servicios
 	jwtExpiry := time.Duration(jwtExpiryHours) * time.Hour
 	authService := auth.NewService(pg, tbClient, jwtSecret, jwtExpiry)
 	authHandler := auth.NewHandler(authService)
+
+	// Reconciliador
+	reconciler := recovery.NewReconciler(pg, tbClient)
+	go reconciler.Start(rootCtx, time.Duration(reconcileInterval)*time.Minute)
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
@@ -109,6 +119,9 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 	log.Println("🛑 Cerrando...")
+
+	// Cancelar servicios de background.
+	rootCancel()
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
