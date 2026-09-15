@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
 	"banking-system/internal/account"
 	"banking-system/internal/apperr"
@@ -350,17 +351,26 @@ func extractPendingConfirmation(result any, userID string) *PendingOperation {
 		return nil
 	}
 
-	return &PendingOperation{
+	pending := &PendingOperation{
 		Token:       token,
 		Type:        opType,
 		AmountCents: extractInt64(op["amount_cents"]),
 		ToAccountID: getString(op, "to_account_id"),
 		UserID:      userID,
 	}
-}
 
-// extractInt64 convierte un valor de map a int64.
-//
+	// expires_at puede venir como time.Time (Executor) o string (JSON).
+	switch v := op["expires_at"].(type) {
+	case time.Time:
+		pending.ExpiresAt = v
+	case string:
+		if t, err := time.Parse(time.RFC3339, v); err == nil {
+			pending.ExpiresAt = t
+		}
+	}
+
+	return pending
+} // extractInt64 convierte un valor de map a int64.
 // Acepta int64, float64, int y json.Number. Devuelve 0 si no puede.
 // Evita el panic de type assertions directas.
 func extractInt64(v any) int64 {

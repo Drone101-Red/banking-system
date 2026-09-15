@@ -111,7 +111,7 @@ func main() {
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
-	r.Use(middleware.Timeout(30 * time.Second))
+	r.Use(middleware.Timeout(90 * time.Second))
 
 	r.Get("/health", healthHandler(pg, tbClient))
 
