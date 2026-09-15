@@ -1,4 +1,3 @@
-// Package chat implementa el chat con IA sobre OpenRouter.
 package chat
 
 import (
@@ -20,28 +19,40 @@ const (
 	maxToolCallIterations = 10
 
 	// maxHistoryMessages acota el historial que se envía al modelo.
-	// Cada turno son 2 mensajes (user + assistant), así que 20
-	// mensajes = 10 turnos de conversación.
 	maxHistoryMessages = 20
 )
 
 // SystemPrompt es el system prompt del asistente.
 //
 // Es crítico: define las reglas de comportamiento, en particular
-// la obligación de pedir confirmación antes de ejecutar tools de
-// escritura.
+// la obligación de llamar a la tool INMEDIATAMENTE para operaciones
+// de escritura. El backend se encarga de la confirmación mediante
+// un token de dos fases.
 const SystemPrompt = `Eres un asistente bancario que ayuda al usuario a gestionar su cuenta.
 
 REGLAS:
 - Responde SIEMPRE en español, de forma clara y concisa.
 - Los montos están en CENTAVOS. $10.50 = 1050 centavos.
-- SIEMPRE pide confirmación explícita antes de ejecutar deposit, withdraw o transfer.
-  Ejemplo: "Voy a transferir $50.00 a la cuenta abc... ¿Confirmas?"
-- Solo ejecuta la tool cuando el usuario confirme ("sí", "confirmo", "dale", etc.).
-- Si una tool falla, explica el error al usuario sin tecnicismos.
 - No inventes datos. Usa las tools para consultar información real.
 - No reveles detalles técnicos (nombres de tablas, IDs internos, etc.).
-- No ejecutes más de una operación de escritura por turno.`
+- No ejecutes más de una operación de escritura por turno.
+
+OPERACIONES DE ESCRITURA (deposit, withdraw, transfer):
+Cuando el usuario pida una operación de escritura, LLAMA A LA TOOL
+INMEDIATAMENTE, sin pedir confirmación previa. Ejemplo:
+
+  Usuario: "Deposita $50 a mi cuenta"
+  Tú: [llamas a la tool deposit con amount_cents=5000]
+
+La tool NO ejecutará la operación. Devolverá un resultado con
+status="pending_confirmation" y un token. En ese momento:
+  1. Informa al usuario qué operación está pendiente.
+  2. Pide confirmación explícita ("¿Confirmas?").
+  3. El frontend llamará a POST /api/chat/confirm con el token.
+  4. Tú NO necesitas llamar a ninguna tool adicional.
+
+NUNCA pidas confirmación ANTES de llamar a la tool.
+La confirmación ocurre DESPUÉS, cuando el usuario ve el token.`
 
 // ChatRequestDTO es el body de POST /api/chat.
 type ChatRequestDTO struct {
@@ -51,18 +62,27 @@ type ChatRequestDTO struct {
 
 // ChatResult es la respuesta del chat.
 type ChatResult struct {
-	Reply     string     `json:"reply"`
-	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
-	Usage     Usage      `json:"usage"`
+	Reply               string            `json:"reply"`
+	ToolCalls           []ToolCall        `json:"tool_calls,omitempty"`
+	PendingConfirmation *PendingOperation `json:"pending_confirmation,omitempty"`
+	Usage               Usage             `json:"usage"`
+}
+
+// ConfirmResult es la respuesta de POST /api/chat/confirm.
+type ConfirmResult struct {
+	Success   bool   `json:"success"`
+	Message   string `json:"message"`
+	Operation string `json:"operation"`
 }
 
 // Service orquesta el chat con tool calling.
 type Service struct {
-	pg         *db.PostgresStore
-	accountSvc *account.Service
-	txnSvc     *transactions.Service
-	client     *OpenRouterClient
-	executor   *Executor
+	pg           *db.PostgresStore
+	accountSvc   *account.Service
+	txnSvc       *transactions.Service
+	client       *OpenRouterClient
+	executor     *Executor
+	confirmStore ConfirmationStore
 }
 
 // NewService construye el Service.
@@ -71,13 +91,15 @@ func NewService(
 	accountSvc *account.Service,
 	txnSvc *transactions.Service,
 	client *OpenRouterClient,
+	confirmStore ConfirmationStore,
 ) *Service {
 	return &Service{
-		pg:         pg,
-		accountSvc: accountSvc,
-		txnSvc:     txnSvc,
-		client:     client,
-		executor:   NewExecutor(accountSvc, txnSvc),
+		pg:           pg,
+		accountSvc:   accountSvc,
+		txnSvc:       txnSvc,
+		client:       client,
+		confirmStore: confirmStore,
+		executor:     NewExecutor(accountSvc, txnSvc, confirmStore),
 	}
 }
 
@@ -86,20 +108,6 @@ func NewService(
 // El userID viene del JWT (middleware RequireAuth). El modelo NUNCA
 // lo ve. Cuando ejecuta una tool, el Executor lo usa para operar sobre
 // la cuenta del usuario autenticado.
-//
-// Loop:
-//  1. Construir messages (system + history + user message).
-//  2. Llamar a OpenRouter con las tools.
-//  3. Si el modelo pide tools: ejecutarlas, agregar resultados, repetir.
-//  4. Si el modelo da respuesta final: devolverla.
-//
-// Casos manejados:
-//   - No hay tool calls → respuesta final.
-//   - Hay tool calls y content no vacío → ejecutar tools y devolver content.
-//   - Hay tool calls sin content → ejecutar tools y seguir el loop.
-//
-// Si el modelo se queda en loop o no da respuesta, se devuelve un
-// fallback construido a partir de las tools ejecutadas.
 func (s *Service) Chat(
 	ctx context.Context,
 	userID string,
@@ -111,8 +119,11 @@ func (s *Service) Chat(
 
 	messages := s.buildInitialMessages(req)
 
-	var executedTools []ToolCall
-	var totalUsage Usage
+	var (
+		executedTools  []ToolCall
+		totalUsage     Usage
+		pendingConfirm *PendingOperation
+	)
 
 	for i := 0; i < maxToolCallIterations; i++ {
 		resp, err := s.client.ChatCompletion(ctx, ChatRequest{
@@ -129,37 +140,41 @@ func (s *Service) Chat(
 
 		choice := resp.Choices[0]
 
-		// --- Caso 1: no hay tool calls → respuesta final. ---
+		// Caso 1: no hay tool calls → respuesta final.
 		if len(choice.Message.ToolCalls) == 0 {
-			reply := strings.TrimSpace(choice.Message.Content)
-			if reply == "" {
+			reply := choice.Message.Content
+			if strings.TrimSpace(reply) == "" {
 				reply = buildFallbackReply(executedTools)
 			}
 			return &ChatResult{
-				Reply:     reply,
-				ToolCalls: executedTools,
-				Usage:     totalUsage,
+				Reply:               reply,
+				ToolCalls:           executedTools,
+				PendingConfirmation: pendingConfirm,
+				Usage:               totalUsage,
 			}, nil
 		}
 
-		// --- Caso 2: hay tool calls Y content no vacío. ---
+		// Caso 2: hay tool calls + content no vacío.
 		// El modelo quiere ejecutar tools Y decir algo.
-		// Ejecutamos las tools y devolvemos el content como respuesta.
 		if strings.TrimSpace(choice.Message.Content) != "" {
 			for _, tc := range choice.Message.ToolCalls {
-				if _, err := s.executeToolCall(ctx, userID, tc); err != nil {
-					log.Printf("[chat] tool %s falló: %v", tc.Function.Name, err)
+				result, err := s.executeToolCall(ctx, userID, tc)
+				if err == nil {
+					if op := extractPendingConfirmation(result, userID); op != nil {
+						pendingConfirm = op
+					}
 				}
 				executedTools = append(executedTools, tc)
 			}
 			return &ChatResult{
-				Reply:     strings.TrimSpace(choice.Message.Content),
-				ToolCalls: executedTools,
-				Usage:     totalUsage,
+				Reply:               choice.Message.Content,
+				ToolCalls:           executedTools,
+				PendingConfirmation: pendingConfirm,
+				Usage:               totalUsage,
 			}, nil
 		}
 
-		// --- Caso 3: hay tool calls sin content → ejecutar y seguir. ---
+		// Caso 3: hay tool calls sin content → ejecutar y seguir el loop.
 		messages = append(messages, choice.Message)
 
 		for _, tc := range choice.Message.ToolCalls {
@@ -172,6 +187,10 @@ func (s *Service) Chat(
 			} else {
 				contentBytes, _ := json.Marshal(result)
 				content = string(contentBytes)
+
+				if op := extractPendingConfirmation(result, userID); op != nil {
+					pendingConfirm = op
+				}
 			}
 
 			messages = append(messages, Message{
@@ -185,12 +204,45 @@ func (s *Service) Chat(
 		}
 	}
 
-	// Si llegamos acá, el modelo no dio respuesta final en N iteraciones.
-	// Devolvemos un fallback con las tools que sí se ejecutaron.
-	return &ChatResult{
-		Reply:     buildFallbackReply(executedTools),
-		ToolCalls: executedTools,
-		Usage:     totalUsage,
+	return nil, apperr.Internal(fmt.Errorf(
+		"el modelo no dio respuesta final después de %d iteraciones",
+		maxToolCallIterations,
+	))
+}
+
+// ConfirmOperation ejecuta la operación pendiente identificada por el token.
+//
+// Es el segundo paso del two-phase commit:
+//  1. El modelo propone la operación → se guarda como pending.
+//  2. El usuario confirma → se ejecuta.
+func (s *Service) ConfirmOperation(
+	ctx context.Context,
+	userID, token string,
+) (*ConfirmResult, error) {
+	op, err := s.confirmStore.Consume(ctx, token, userID)
+	if err != nil {
+		return nil, err
+	}
+
+	switch op.Type {
+	case "deposit":
+		_, err = s.txnSvc.Deposit(ctx, userID, op.AmountCents, token)
+	case "withdraw":
+		_, err = s.txnSvc.Withdraw(ctx, userID, op.AmountCents, token)
+	case "transfer":
+		_, err = s.txnSvc.Transfer(ctx, userID, op.ToAccountID, op.AmountCents, token)
+	default:
+		return nil, apperr.Internal(fmt.Errorf("tipo de operación desconocido: %s", op.Type))
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	return &ConfirmResult{
+		Success:   true,
+		Message:   fmt.Sprintf("Operación '%s' ejecutada correctamente", op.Type),
+		Operation: op.Type,
 	}, nil
 }
 
@@ -200,14 +252,12 @@ func (s *Service) buildInitialMessages(req ChatRequestDTO) []Message {
 		{Role: "system", Content: SystemPrompt},
 	}
 
-	// Agregar historial (limitado)
 	history := req.History
 	if len(history) > maxHistoryMessages {
 		history = history[len(history)-maxHistoryMessages:]
 	}
 	messages = append(messages, history...)
 
-	// Agregar mensaje nuevo del usuario
 	messages = append(messages, Message{
 		Role:    "user",
 		Content: req.Message,
@@ -226,7 +276,6 @@ func (s *Service) executeToolCall(
 		return nil, fmt.Errorf("tipo de tool no soportado: %s", tc.Type)
 	}
 
-	// Parsear argumentos (JSON string).
 	var args map[string]any
 	if tc.Function.Arguments != "" {
 		if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
@@ -240,19 +289,13 @@ func (s *Service) executeToolCall(
 	return s.executor.Execute(ctx, userID, tc.ID, tc.Function.Name, args)
 }
 
+// --- Helpers ---
+
 // buildFallbackReply genera una respuesta si el modelo no dio una.
-//
-// Se usa cuando:
-//   - El modelo devolvió content vacío en la respuesta final.
-//   - El modelo se quedó en loop sin dar respuesta final.
-//
-// En ambos casos, construimos un mensaje a partir de las tools que
-// sí se ejecutaron.
 func buildFallbackReply(tools []ToolCall) string {
 	if len(tools) == 0 {
 		return "No pude procesar tu mensaje. ¿Podrías reformularlo?"
 	}
-
 	last := tools[len(tools)-1].Function.Name
 	switch last {
 	case "get_balance":
@@ -260,12 +303,78 @@ func buildFallbackReply(tools []ToolCall) string {
 	case "get_history":
 		return "Consulté tu historial."
 	case "deposit":
-		return "Depósito realizado correctamente."
+		return "Depósito pendiente de confirmación."
 	case "withdraw":
-		return "Retiro realizado correctamente."
+		return "Retiro pendiente de confirmación."
 	case "transfer":
-		return "Transferencia realizada correctamente."
+		return "Transferencia pendiente de confirmación."
 	default:
 		return "Operación completada."
+	}
+}
+
+// getString devuelve un valor string de un map, o "" si no existe.
+func getString(m map[string]any, key string) string {
+	if v, ok := m[key].(string); ok {
+		return v
+	}
+	return ""
+}
+
+// extractPendingConfirmation extrae una PendingOperation del resultado
+// de una tool, si el resultado contiene status="pending_confirmation".
+//
+// Es defensivo con los tipos: el resultado puede venir de:
+//   - map[string]any con int64 (creado en Go).
+//   - map[string]any con float64 (deserializado de JSON).
+//
+// Devuelve nil si el resultado no es una pending confirmation.
+func extractPendingConfirmation(result any, userID string) *PendingOperation {
+	op, ok := result.(map[string]any)
+	if !ok {
+		return nil
+	}
+
+	status, ok := op["status"].(string)
+	if !ok || status != "pending_confirmation" {
+		return nil
+	}
+
+	token, ok := op["confirmation_token"].(string)
+	if !ok || token == "" {
+		return nil
+	}
+
+	opType, ok := op["type"].(string)
+	if !ok {
+		return nil
+	}
+
+	return &PendingOperation{
+		Token:       token,
+		Type:        opType,
+		AmountCents: extractInt64(op["amount_cents"]),
+		ToAccountID: getString(op, "to_account_id"),
+		UserID:      userID,
+	}
+}
+
+// extractInt64 convierte un valor de map a int64.
+//
+// Acepta int64, float64, int y json.Number. Devuelve 0 si no puede.
+// Evita el panic de type assertions directas.
+func extractInt64(v any) int64 {
+	switch n := v.(type) {
+	case int64:
+		return n
+	case float64:
+		return int64(n)
+	case int:
+		return int64(n)
+	case json.Number:
+		i, _ := n.Int64()
+		return i
+	default:
+		return 0
 	}
 }

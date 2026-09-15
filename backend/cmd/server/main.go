@@ -98,7 +98,8 @@ func main() {
 
 	// Wiring de chat
 	openRouterClient := chat.NewOpenRouterClient(openRouterKey, openRouterModel)
-	chatService := chat.NewService(pg, acctService, txnService, openRouterClient)
+	confirmStore := chat.NewPostgresConfirmationStore(pg)
+	chatService := chat.NewService(pg, acctService, txnService, openRouterClient, confirmStore)
 	chatHandler := chat.NewHandler(chatService)
 
 	// Reconciliador
@@ -146,6 +147,7 @@ func main() {
 	r.Group(func(r chi.Router) {
 		r.Use(auth.RequireAuth(jwtSecret))
 		r.Post("/api/chat", chatHandler.ChatHandler)
+		r.Post("/api/chat/confirm", chatHandler.ConfirmHandler)
 	})
 
 	srv := &http.Server{

@@ -2,7 +2,6 @@ package chat
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 
 	"banking-system/internal/account"
@@ -40,13 +39,13 @@ func Tools() []ToolDefinition {
 			Type: "function",
 			Function: FunctionDefinition{
 				Name:        "get_history",
-				Description: "Devuelve las últimas transacciones del usuario autenticado. Por defecto devuelve las últimas 10.",
+				Description: "Devuelve las últimas transacciones del usuario autenticado.",
 				Parameters: map[string]any{
 					"type": "object",
 					"properties": map[string]any{
 						"limit": map[string]any{
 							"type":        "integer",
-							"description": "Número máximo de transacciones a devolver (1-50).",
+							"description": "Número máximo de transacciones (1-50).",
 							"minimum":     1,
 							"maximum":     50,
 						},
@@ -58,13 +57,13 @@ func Tools() []ToolDefinition {
 			Type: "function",
 			Function: FunctionDefinition{
 				Name:        "deposit",
-				Description: "Deposita dinero en la cuenta del usuario autenticado. SIEMPRE debes pedir confirmación al usuario antes de llamar esta tool.",
+				Description: "Deposita dinero en la cuenta del usuario. Requiere confirmación.",
 				Parameters: map[string]any{
 					"type": "object",
 					"properties": map[string]any{
 						"amount_cents": map[string]any{
 							"type":        "integer",
-							"description": "Cantidad a depositar en centavos. Por ejemplo, $10.50 = 1050.",
+							"description": "Cantidad en centavos. $10.50 = 1050.",
 							"minimum":     1,
 						},
 					},
@@ -76,13 +75,13 @@ func Tools() []ToolDefinition {
 			Type: "function",
 			Function: FunctionDefinition{
 				Name:        "withdraw",
-				Description: "Retira dinero de la cuenta del usuario autenticado. SIEMPRE debes pedir confirmación al usuario antes de llamar esta tool.",
+				Description: "Retira dinero de la cuenta del usuario. Requiere confirmación.",
 				Parameters: map[string]any{
 					"type": "object",
 					"properties": map[string]any{
 						"amount_cents": map[string]any{
 							"type":        "integer",
-							"description": "Cantidad a retirar en centavos. Por ejemplo, $30.00 = 3000.",
+							"description": "Cantidad en centavos.",
 							"minimum":     1,
 						},
 					},
@@ -94,18 +93,18 @@ func Tools() []ToolDefinition {
 			Type: "function",
 			Function: FunctionDefinition{
 				Name:        "transfer",
-				Description: "Transfiere dinero a otra cuenta. SIEMPRE debes pedir confirmación al usuario antes de llamar esta tool.",
+				Description: "Transfiere dinero a otra cuenta. Requiere confirmación.",
 				Parameters: map[string]any{
 					"type": "object",
 					"properties": map[string]any{
 						"to_account_id": map[string]any{
 							"type":        "string",
-							"description": "Identificador de la cuenta destino (hex de 32 caracteres).",
+							"description": "ID de la cuenta destino (hex 32 chars).",
 							"pattern":     "^[0-9a-fA-F]{32}$",
 						},
 						"amount_cents": map[string]any{
 							"type":        "integer",
-							"description": "Cantidad a transferir en centavos.",
+							"description": "Cantidad en centavos.",
 							"minimum":     1,
 						},
 					},
@@ -116,28 +115,36 @@ func Tools() []ToolDefinition {
 	}
 }
 
-// --- Ejecutores ---
+// --- Executor ---
 
 // Executor ejecuta las tools contra los servicios del backend.
+//
+// Las tools de consulta (get_balance, get_history) se ejecutan directamente.
+// Las tools de escritura (deposit, withdraw, transfer) NO se ejecutan:
+// generan una PendingOperation que el usuario debe confirmar.
 type Executor struct {
-	accountSvc *account.Service
-	txnSvc     *transactions.Service
+	accountSvc   *account.Service
+	txnSvc       *transactions.Service
+	confirmStore ConfirmationStore
 }
 
 // NewExecutor construye el Executor.
-func NewExecutor(accountSvc *account.Service, txnSvc *transactions.Service) *Executor {
+func NewExecutor(
+	accountSvc *account.Service,
+	txnSvc *transactions.Service,
+	confirmStore ConfirmationStore,
+) *Executor {
 	return &Executor{
-		accountSvc: accountSvc,
-		txnSvc:     txnSvc,
+		accountSvc:   accountSvc,
+		txnSvc:       txnSvc,
+		confirmStore: confirmStore,
 	}
 }
 
 // Execute ejecuta la tool indicada.
 //
-// userID es el UUID del usuario autenticado (viene del JWT, NO del modelo).
-// toolCallID es el ID de la llamada del modelo. Se usa como idempotency
-// key para las tools de escritura: si el modelo pide la misma tool con
-// el mismo ID, no se duplica la transferencia.
+// Para tools de escritura, devuelve una PendingOperation. El backend
+// NO ejecuta la operación hasta que el usuario confirme con el token.
 func (e *Executor) Execute(
 	ctx context.Context,
 	userID string,
@@ -150,12 +157,8 @@ func (e *Executor) Execute(
 		return e.execGetBalance(ctx, userID)
 	case "get_history":
 		return e.execGetHistory(ctx, userID, args)
-	case "deposit":
-		return e.execDeposit(ctx, userID, toolCallID, args)
-	case "withdraw":
-		return e.execWithdraw(ctx, userID, toolCallID, args)
-	case "transfer":
-		return e.execTransfer(ctx, userID, toolCallID, args)
+	case "deposit", "withdraw", "transfer":
+		return e.createPendingConfirmation(ctx, userID, name, args)
 	default:
 		return nil, apperr.BadRequest("UNKNOWN_TOOL", fmt.Sprintf("Tool desconocida: %s", name))
 	}
@@ -211,10 +214,11 @@ func (e *Executor) execGetHistory(ctx context.Context, userID string, args map[s
 	}, nil
 }
 
-func (e *Executor) execDeposit(
+// createPendingConfirmation genera una PendingOperation para una tool
+// de escritura. NO ejecuta la operación.
+func (e *Executor) createPendingConfirmation(
 	ctx context.Context,
-	userID string,
-	toolCallID string,
+	userID, toolName string,
 	args map[string]any,
 ) (any, error) {
 	amount, err := extractAmount(args)
@@ -222,70 +226,34 @@ func (e *Executor) execDeposit(
 		return nil, err
 	}
 
-	tx, err := e.txnSvc.Deposit(ctx, userID, amount, toolCallID)
-	if err != nil {
+	op := &PendingOperation{
+		Type:        toolName,
+		AmountCents: amount,
+		UserID:      userID,
+	}
+
+	if toolName == "transfer" {
+		toAccountID, ok := args["to_account_id"].(string)
+		if !ok || toAccountID == "" {
+			return nil, apperr.BadRequest("MISSING_TO_ACCOUNT_ID", "Falta el campo to_account_id")
+		}
+		op.ToAccountID = toAccountID
+	}
+
+	if err := e.confirmStore.Save(ctx, op); err != nil {
 		return nil, err
 	}
 
 	return map[string]any{
-		"transaction_id":   tx.ID,
-		"amount_cents":     tx.AmountCents,
-		"amount_formatted": formatCents(tx.AmountCents),
-		"message":          "Depósito realizado correctamente",
-	}, nil
-}
-
-func (e *Executor) execWithdraw(
-	ctx context.Context,
-	userID string,
-	toolCallID string,
-	args map[string]any,
-) (any, error) {
-	amount, err := extractAmount(args)
-	if err != nil {
-		return nil, err
-	}
-
-	tx, err := e.txnSvc.Withdraw(ctx, userID, amount, toolCallID)
-	if err != nil {
-		return nil, err
-	}
-
-	return map[string]any{
-		"transaction_id":   tx.ID,
-		"amount_cents":     tx.AmountCents,
-		"amount_formatted": formatCents(tx.AmountCents),
-		"message":          "Retiro realizado correctamente",
-	}, nil
-}
-
-func (e *Executor) execTransfer(
-	ctx context.Context,
-	userID string,
-	toolCallID string,
-	args map[string]any,
-) (any, error) {
-	toAccountID, ok := args["to_account_id"].(string)
-	if !ok || toAccountID == "" {
-		return nil, apperr.BadRequest("MISSING_TO_ACCOUNT_ID", "Falta el campo to_account_id")
-	}
-
-	amount, err := extractAmount(args)
-	if err != nil {
-		return nil, err
-	}
-
-	tx, err := e.txnSvc.Transfer(ctx, userID, toAccountID, amount, toolCallID)
-	if err != nil {
-		return nil, err
-	}
-
-	return map[string]any{
-		"transaction_id":   tx.ID,
-		"amount_cents":     tx.AmountCents,
-		"amount_formatted": formatCents(tx.AmountCents),
-		"to_account_id":    toAccountID,
-		"message":          "Transferencia realizada correctamente",
+		"status":             "pending_confirmation",
+		"confirmation_token": op.Token,
+		"type":               op.Type,
+		"amount_cents":       op.AmountCents,
+		"amount_formatted":   formatCents(op.AmountCents),
+		"to_account_id":      op.ToAccountID,
+		"expires_at":         op.ExpiresAt,
+		"message": "Operación pendiente de confirmación. " +
+			"Pide al usuario que confirme y luego llama a POST /api/chat/confirm con el token.",
 	}, nil
 }
 
@@ -333,6 +301,3 @@ func codeDescription(code uint16) string {
 		return "unknown"
 	}
 }
-
-// unused: eliminar imports si no se usan
-var _ = json.Marshal
