@@ -87,6 +87,7 @@ func main() {
 	// Rutas de auth
 	r.Route("/api/auth", func(r chi.Router) {
 		r.Post("/register", authHandler.RegisterHandler)
+		r.Post("/login", authHandler.LoginHandler)
 	})
 
 	srv := &http.Server{

@@ -38,9 +38,6 @@ func (h *Handler) RegisterHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Respuesta: solo campos públicos. PasswordHash y TBAccountID
-	// tienen json:"-" en el modelo, así que no se filtran aunque
-	// serialicemos el user completo.
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	if err := json.NewEncoder(w).Encode(map[string]any{
@@ -49,6 +46,47 @@ func (h *Handler) RegisterHandler(w http.ResponseWriter, r *http.Request) {
 		"full_name": user.FullName,
 		"status":    user.Status,
 	}); err != nil {
-		log.Printf("[auth] error serializando respuesta: %v", err)
+		log.Printf("[auth] error serializando respuesta register: %v", err)
+	}
+}
+
+// LoginHandler maneja POST /api/auth/login.
+//
+// Respuestas:
+//
+//	200 → { "token": "...", "user": {...} }
+//	400 → validación (email o password vacíos)
+//	401 → credenciales inválidas o cuenta PENDING
+func (h *Handler) LoginHandler(w http.ResponseWriter, r *http.Request) {
+	var req LoginRequest
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+
+	if err := dec.Decode(&req); err != nil {
+		apperr.Write(w, apperr.BadRequest(
+			"INVALID_REQUEST",
+			"El cuerpo de la solicitud no es válido",
+		))
+		return
+	}
+
+	user, token, err := h.service.Login(r.Context(), req)
+	if err != nil {
+		apperr.Write(w, err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(map[string]any{
+		"token": token,
+		"user": map[string]any{
+			"id":        user.ID,
+			"email":     user.Email,
+			"full_name": user.FullName,
+			"status":    user.Status,
+		},
+	}); err != nil {
+		log.Printf("[auth] error serializando respuesta login: %v", err)
 	}
 }
