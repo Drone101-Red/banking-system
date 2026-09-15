@@ -124,6 +124,17 @@ func (s *PostgresStore) GetUserByID(ctx context.Context, id string) (*models.Use
 	return s.scanUser(s.db.QueryRowContext(ctx, q, id))
 }
 
+// GetUserByTBAccountID busca un usuario por su tb_account_id (16 bytes).
+func (s *PostgresStore) GetUserByTBAccountID(ctx context.Context, tbID []byte) (*models.User, error) {
+	const q = `
+		SELECT id, email, password_hash, full_name, tb_account_id,
+		       status, created_at, updated_at
+		FROM users
+		WHERE tb_account_id = $1`
+
+	return s.scanUser(s.db.QueryRowContext(ctx, q, tbID))
+}
+
 // UpdateUserStatusActive marca un usuario PENDING como ACTIVE.
 func (s *PostgresStore) UpdateUserStatusActive(ctx context.Context, id string) error {
 	const q = `
