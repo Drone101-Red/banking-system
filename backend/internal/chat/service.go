@@ -237,7 +237,7 @@ func (s *Service) executeToolCall(
 		args = map[string]any{}
 	}
 
-	return s.executor.Execute(ctx, userID, tc.Function.Name, args)
+	return s.executor.Execute(ctx, userID, tc.ID, tc.Function.Name, args)
 }
 
 // buildFallbackReply genera una respuesta si el modelo no dio una.

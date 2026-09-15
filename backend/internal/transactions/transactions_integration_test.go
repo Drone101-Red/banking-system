@@ -3,6 +3,7 @@
 package transactions_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -301,5 +302,83 @@ func TestHistory_Integration(t *testing.T) {
 	if result.Page != 1 || result.Limit != 10 || result.TotalPages != 1 {
 		t.Fatalf("paginación incorrecta: page=%d limit=%d totalPages=%d",
 			result.Page, result.Limit, result.TotalPages)
+	}
+}
+func TestDeposit_Idempotent_Integration(t *testing.T) {
+	env := newTestEnv(t)
+	ctx := context.Background()
+
+	user := createActiveUser(t, env, "idem")
+
+	key := "test-idempotency-key-12345"
+
+	// Primera llamada
+	tx1, err := env.svc.Deposit(ctx, user.ID, 5000, key)
+	if err != nil {
+		t.Fatalf("primer Deposit: %v", err)
+	}
+
+	// Segunda llamada con la misma key
+	tx2, err := env.svc.Deposit(ctx, user.ID, 5000, key)
+	if err != nil {
+		t.Fatalf("segundo Deposit: %v", err)
+	}
+
+	// El TBTransferID debe ser el mismo
+	if !bytes.Equal(tx1.TBTransferID, tx2.TBTransferID) {
+		t.Fatalf("TBTransferID distinto: %x vs %x", tx1.TBTransferID, tx2.TBTransferID)
+	}
+
+	// El saldo debe ser 5000, no 10000
+	balance, err := env.tb.GetBalance(tbIDFromBytes(user.TBAccountID))
+	if err != nil {
+		t.Fatalf("GetBalance: %v", err)
+	}
+	if balance != 5000 {
+		t.Fatalf("balance = %d, esperado 5000 (no duplicado)", balance)
+	}
+}
+
+func TestTransfer_Idempotent_Integration(t *testing.T) {
+	env := newTestEnv(t)
+	ctx := context.Background()
+
+	alice := createActiveUser(t, env, "idem-alice")
+	bob := createActiveUser(t, env, "idem-bob")
+
+	// Depositar a Alice
+	if _, err := env.svc.Deposit(ctx, alice.ID, 10000, ""); err != nil {
+		t.Fatalf("Deposit Alice: %v", err)
+	}
+
+	bobTBHex := hex.EncodeToString(bob.TBAccountID)
+	key := "transfer-idem-key-abc"
+
+	// Primera transferencia
+	tx1, err := env.svc.Transfer(ctx, alice.ID, bobTBHex, 3000, key)
+	if err != nil {
+		t.Fatalf("primera Transfer: %v", err)
+	}
+
+	// Segunda transferencia con la misma key
+	tx2, err := env.svc.Transfer(ctx, alice.ID, bobTBHex, 3000, key)
+	if err != nil {
+		t.Fatalf("segunda Transfer: %v", err)
+	}
+
+	// Mismo TBTransferID
+	if !bytes.Equal(tx1.TBTransferID, tx2.TBTransferID) {
+		t.Fatalf("TBTransferID distinto")
+	}
+
+	// Saldos: Alice 7000, Bob 3000
+	aliceBalance, _ := env.tb.GetBalance(tbIDFromBytes(alice.TBAccountID))
+	bobBalance, _ := env.tb.GetBalance(tbIDFromBytes(bob.TBAccountID))
+
+	if aliceBalance != 7000 {
+		t.Fatalf("alice balance = %d, esperado 7000", aliceBalance)
+	}
+	if bobBalance != 3000 {
+		t.Fatalf("bob balance = %d, esperado 3000 (no duplicado)", bobBalance)
 	}
 }

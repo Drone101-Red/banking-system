@@ -1,19 +1,9 @@
-// Package chat implementa el chat con IA sobre OpenRouter.
-//
-// Usa tool calling estilo OpenAI (compatible con OpenRouter). Las tools
-// exponen las operaciones bancarias del sistema al modelo.
-//
-// IMPORTANTE: el userID siempre viene del JWT (via middleware). El modelo
-// NUNCA ve el userID real. Solo ve el tb_account_id cuando la tool lo
-// necesita como argumento.
 package chat
 
 import (
 	"context"
-	"encoding/hex"
+	"encoding/json"
 	"fmt"
-
-	tb "github.com/tigerbeetle/tigerbeetle-go"
 
 	"banking-system/internal/account"
 	"banking-system/internal/apperr"
@@ -22,24 +12,17 @@ import (
 
 // --- Definiciones de tools ---
 
-// ToolDefinition es la definición de una tool en formato OpenAI.
 type ToolDefinition struct {
 	Type     string             `json:"type"`
 	Function FunctionDefinition `json:"function"`
 }
 
-// FunctionDefinition describe una función ejecutable por el modelo.
 type FunctionDefinition struct {
 	Name        string         `json:"name"`
 	Description string         `json:"description"`
 	Parameters  map[string]any `json:"parameters"`
 }
 
-// Tools devuelve las 5 tools expuestas al modelo.
-//
-// Las tools de consulta (get_balance, get_history) son libres.
-// Las tools de escritura (deposit, withdraw, transfer) requieren
-// confirmación previa del usuario — eso lo maneja el system prompt.
 func Tools() []ToolDefinition {
 	return []ToolDefinition{
 		{
@@ -152,12 +135,13 @@ func NewExecutor(accountSvc *account.Service, txnSvc *transactions.Service) *Exe
 // Execute ejecuta la tool indicada.
 //
 // userID es el UUID del usuario autenticado (viene del JWT, NO del modelo).
-// name es el nombre de la tool. args son los argumentos parseados.
-//
-// Devuelve un valor serializable a JSON que se pasa de vuelta al modelo.
+// toolCallID es el ID de la llamada del modelo. Se usa como idempotency
+// key para las tools de escritura: si el modelo pide la misma tool con
+// el mismo ID, no se duplica la transferencia.
 func (e *Executor) Execute(
 	ctx context.Context,
 	userID string,
+	toolCallID string,
 	name string,
 	args map[string]any,
 ) (any, error) {
@@ -167,11 +151,11 @@ func (e *Executor) Execute(
 	case "get_history":
 		return e.execGetHistory(ctx, userID, args)
 	case "deposit":
-		return e.execDeposit(ctx, userID, args)
+		return e.execDeposit(ctx, userID, toolCallID, args)
 	case "withdraw":
-		return e.execWithdraw(ctx, userID, args)
+		return e.execWithdraw(ctx, userID, toolCallID, args)
 	case "transfer":
-		return e.execTransfer(ctx, userID, args)
+		return e.execTransfer(ctx, userID, toolCallID, args)
 	default:
 		return nil, apperr.BadRequest("UNKNOWN_TOOL", fmt.Sprintf("Tool desconocida: %s", name))
 	}
@@ -209,7 +193,6 @@ func (e *Executor) execGetHistory(ctx context.Context, userID string, args map[s
 		return nil, err
 	}
 
-	// Formatear las transacciones para el modelo.
 	txs := make([]map[string]any, 0, len(result.Transactions))
 	for _, tx := range result.Transactions {
 		txs = append(txs, map[string]any{
@@ -228,13 +211,18 @@ func (e *Executor) execGetHistory(ctx context.Context, userID string, args map[s
 	}, nil
 }
 
-func (e *Executor) execDeposit(ctx context.Context, userID string, args map[string]any) (any, error) {
+func (e *Executor) execDeposit(
+	ctx context.Context,
+	userID string,
+	toolCallID string,
+	args map[string]any,
+) (any, error) {
 	amount, err := extractAmount(args)
 	if err != nil {
 		return nil, err
 	}
 
-	tx, err := e.txnSvc.Deposit(ctx, userID, amount, "")
+	tx, err := e.txnSvc.Deposit(ctx, userID, amount, toolCallID)
 	if err != nil {
 		return nil, err
 	}
@@ -247,13 +235,18 @@ func (e *Executor) execDeposit(ctx context.Context, userID string, args map[stri
 	}, nil
 }
 
-func (e *Executor) execWithdraw(ctx context.Context, userID string, args map[string]any) (any, error) {
+func (e *Executor) execWithdraw(
+	ctx context.Context,
+	userID string,
+	toolCallID string,
+	args map[string]any,
+) (any, error) {
 	amount, err := extractAmount(args)
 	if err != nil {
 		return nil, err
 	}
 
-	tx, err := e.txnSvc.Withdraw(ctx, userID, amount, "")
+	tx, err := e.txnSvc.Withdraw(ctx, userID, amount, toolCallID)
 	if err != nil {
 		return nil, err
 	}
@@ -266,7 +259,12 @@ func (e *Executor) execWithdraw(ctx context.Context, userID string, args map[str
 	}, nil
 }
 
-func (e *Executor) execTransfer(ctx context.Context, userID string, args map[string]any) (any, error) {
+func (e *Executor) execTransfer(
+	ctx context.Context,
+	userID string,
+	toolCallID string,
+	args map[string]any,
+) (any, error) {
 	toAccountID, ok := args["to_account_id"].(string)
 	if !ok || toAccountID == "" {
 		return nil, apperr.BadRequest("MISSING_TO_ACCOUNT_ID", "Falta el campo to_account_id")
@@ -277,7 +275,7 @@ func (e *Executor) execTransfer(ctx context.Context, userID string, args map[str
 		return nil, err
 	}
 
-	tx, err := e.txnSvc.Transfer(ctx, userID, toAccountID, amount, "")
+	tx, err := e.txnSvc.Transfer(ctx, userID, toAccountID, amount, toolCallID)
 	if err != nil {
 		return nil, err
 	}
@@ -293,9 +291,6 @@ func (e *Executor) execTransfer(ctx context.Context, userID string, args map[str
 
 // --- Helpers ---
 
-// extractAmount extrae y valida amount_cents de los args.
-//
-// JSON deserializa los números como float64, así que hay que convertirlos.
 func extractAmount(args map[string]any) (int64, error) {
 	v, ok := args["amount_cents"]
 	if !ok {
@@ -312,10 +307,9 @@ func extractAmount(args map[string]any) (int64, error) {
 	return amount, nil
 }
 
-// formatCents convierte centavos a string de moneda.
 func formatCents(cents int64) string {
 	negative := cents < 0
-	if negative {
+	if cents < 0 {
 		cents = -cents
 	}
 	dollars := cents / 100
@@ -327,7 +321,6 @@ func formatCents(cents int64) string {
 	return fmt.Sprintf("%s$%d.%02d", sign, dollars, remainder)
 }
 
-// codeDescription devuelve una descripción legible del code.
 func codeDescription(code uint16) string {
 	switch code {
 	case 1:
@@ -341,23 +334,5 @@ func codeDescription(code uint16) string {
 	}
 }
 
-// tbBytesToU128 convierte 16 bytes a Uint128.
-//
-// Reservado para uso futuro: cuando el historial necesite calcular
-// la dirección (in/out) de cada transacción.
-func tbBytesToU128(b []byte) tb.Uint128 {
-	var arr [16]byte
-	copy(arr[:], b)
-	return tb.BytesToUint128(arr)
-}
-
-// hexToBytes16 decodifica un hex de 32 chars a 16 bytes.
-//
-// Reservado para uso futuro: cuando el executor necesite validar el
-// to_account_id antes de pasarlo al servicio.
-func hexToBytes16(s string) ([]byte, error) {
-	if len(s) != 32 {
-		return nil, fmt.Errorf("hex debe tener 32 caracteres")
-	}
-	return hex.DecodeString(s)
-}
+// unused: eliminar imports si no se usan
+var _ = json.Marshal
