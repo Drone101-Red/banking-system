@@ -343,3 +343,54 @@ func (s *PostgresStore) scanUser(row *sql.Row) (*models.User, error) {
 	}
 	return &u, nil
 }
+
+// SavePendingConfirmation guarda una operación pendiente de confirmación.
+// Devuelve el token generado.
+func (s *PostgresStore) SavePendingConfirmation(
+	ctx context.Context,
+	userID string,
+	operationJSON []byte,
+	expiresAt time.Time,
+) (string, time.Time, error) {
+	const q = `
+		INSERT INTO pending_confirmations (user_id, operation, expires_at)
+		VALUES ($1, $2, $3)
+		RETURNING token, expires_at`
+
+	var token string
+	var exp time.Time
+	err := s.db.QueryRowContext(ctx, q, userID, operationJSON, expiresAt).Scan(&token, &exp)
+	if err != nil {
+		return "", time.Time{}, apperr.Internal(fmt.Errorf("insert pending confirmation: %w", err))
+	}
+	return token, exp, nil
+}
+
+// ConsumePendingConfirmation recupera y marca como usada una
+// operación pendiente. Devuelve el operation JSONB y el userID.
+func (s *PostgresStore) ConsumePendingConfirmation(
+	ctx context.Context,
+	token, userID string,
+) ([]byte, error) {
+	const q = `
+		UPDATE pending_confirmations
+		SET used_at = NOW()
+		WHERE token = $1
+		  AND user_id = $2
+		  AND used_at IS NULL
+		  AND expires_at > NOW()
+		RETURNING operation`
+
+	var operationJSON []byte
+	err := s.db.QueryRowContext(ctx, q, token, userID).Scan(&operationJSON)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, apperr.NotFound(
+				"CONFIRMATION_NOT_FOUND",
+				"Operación pendiente no encontrada o expirada",
+			)
+		}
+		return nil, apperr.Internal(fmt.Errorf("consume pending confirmation: %w", err))
+	}
+	return operationJSON, nil
+}
