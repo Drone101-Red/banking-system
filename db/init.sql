@@ -2,18 +2,27 @@
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
 -- Tabla de usuarios
+--
+-- Estados:
+--   PENDING: usuario creado, cuenta TigerBeetle aún no confirmada
+--   ACTIVE:  usuario operativo, cuenta TigerBeetle confirmada
 CREATE TABLE IF NOT EXISTS users (
     id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     email         VARCHAR(255) UNIQUE NOT NULL,
     password_hash VARCHAR(255) NOT NULL,
     full_name     VARCHAR(255) NOT NULL,
     tb_account_id BYTEA NOT NULL UNIQUE,
-    created_at    TIMESTAMP DEFAULT NOW(),
-    updated_at    TIMESTAMP DEFAULT NOW()
+    status        VARCHAR(20) NOT NULL DEFAULT 'PENDING'
+                  CHECK (status IN ('PENDING', 'ACTIVE')),
+    created_at    TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at    TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
 CREATE INDEX IF NOT EXISTS idx_users_tb_account_id ON users(tb_account_id);
+
+-- Índice para el reconciliador: SELECT ... WHERE status = 'PENDING'
+CREATE INDEX IF NOT EXISTS idx_users_status ON users(status);
 
 -- Índice de lectura para el historial.
 -- La verdad financiera está en TigerBeetle; esta tabla es solo un índice
