@@ -51,12 +51,6 @@ func (h *Handler) RegisterHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // LoginHandler maneja POST /api/auth/login.
-//
-// Respuestas:
-//
-//	200 → { "token": "...", "user": {...} }
-//	400 → validación (email o password vacíos)
-//	401 → credenciales inválidas o cuenta PENDING
 func (h *Handler) LoginHandler(w http.ResponseWriter, r *http.Request) {
 	var req LoginRequest
 	dec := json.NewDecoder(r.Body)
@@ -88,5 +82,42 @@ func (h *Handler) LoginHandler(w http.ResponseWriter, r *http.Request) {
 		},
 	}); err != nil {
 		log.Printf("[auth] error serializando respuesta login: %v", err)
+	}
+}
+
+// MeHandler maneja GET /api/auth/me.
+//
+// Requiere el middleware RequireAuth corriendo antes. Lee el UserID y
+// el TBAccountID del context y hace un lookup en PostgreSQL para
+// devolver los datos actuales del usuario.
+//
+// Si el usuario no existe en PG (por ejemplo, fue eliminado después
+// de emitir el token), devuelve 404.
+func (h *Handler) MeHandler(w http.ResponseWriter, r *http.Request) {
+	userID, ok := UserIDFromContext(r.Context())
+	if !ok {
+		// No debería pasar si el middleware corrió antes.
+		apperr.Write(w, apperr.Unauthorized(
+			"TOKEN_REQUIRED",
+			"Se requiere autenticación",
+		))
+		return
+	}
+
+	user, err := h.service.pg.GetUserByID(r.Context(), userID)
+	if err != nil {
+		apperr.Write(w, err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(map[string]any{
+		"id":        user.ID,
+		"email":     user.Email,
+		"full_name": user.FullName,
+		"status":    user.Status,
+	}); err != nil {
+		log.Printf("[auth] error serializando respuesta me: %v", err)
 	}
 }
