@@ -21,6 +21,7 @@ import (
 	"banking-system/internal/models"
 	"banking-system/internal/recovery"
 	"banking-system/internal/tigerbeetle"
+	"banking-system/internal/transactions"
 )
 
 func main() {
@@ -81,6 +82,9 @@ func main() {
 	authService := auth.NewService(pg, tbClient, jwtSecret, jwtExpiry)
 	authHandler := auth.NewHandler(authService)
 
+	txnService := transactions.NewService(pg, tbClient)
+	txnHandler := transactions.NewHandler(txnService)
+
 	// Reconciliador
 	reconciler := recovery.NewReconciler(pg, tbClient)
 	go reconciler.Start(rootCtx, time.Duration(reconcileInterval)*time.Minute)
@@ -104,6 +108,14 @@ func main() {
 			r.Use(auth.RequireAuth(jwtSecret))
 			r.Get("/me", authHandler.MeHandler)
 		})
+	})
+
+	r.Route("/api/transactions", func(r chi.Router) {
+		r.Use(auth.RequireAuth(jwtSecret))
+		r.Post("/deposit", txnHandler.DepositHandler)
+		r.Post("/withdraw", txnHandler.WithdrawHandler)
+		r.Post("/transfer", txnHandler.TransferHandler)
+		r.Get("/history", txnHandler.HistoryHandler)
 	})
 
 	srv := &http.Server{

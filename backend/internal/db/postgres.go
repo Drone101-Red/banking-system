@@ -212,20 +212,34 @@ func (s *PostgresStore) ListPendingUsers(ctx context.Context, limit int) ([]*mod
 //
 // Es idempotente: si el tb_transfer_id ya existe (UNIQUE constraint),
 // el INSERT usa ON CONFLICT DO NOTHING.
+// InsertTransactionLog guarda un índice de la transferencia para el
+// historial. La verdad financiera está en TigerBeetle.
+//
+// Es idempotente: si el tb_transfer_id ya existe (UNIQUE constraint),
+// el INSERT usa ON CONFLICT DO NOTHING y no modifica el struct.
+//
+// Rellena t.ID y t.CreatedAt con los valores generados por PostgreSQL.
 func (s *PostgresStore) InsertTransactionLog(ctx context.Context, t *models.Transaction) error {
 	const q = `
 		INSERT INTO transactions_log
 		    (tb_transfer_id, debit_account_id, credit_account_id, amount_cents, code)
 		VALUES ($1, $2, $3, $4, $5)
-		ON CONFLICT (tb_transfer_id) DO NOTHING`
+		ON CONFLICT (tb_transfer_id) DO NOTHING
+		RETURNING id, created_at`
 
-	_, err := s.db.ExecContext(ctx, q,
+	err := s.db.QueryRowContext(ctx, q,
 		t.TBTransferID,
 		t.DebitAccountID,
 		t.CreditAccountID,
 		t.AmountCents,
 		t.Code,
-	)
+	).Scan(&t.ID, &t.CreatedAt)
+
+	// ON CONFLICT DO NOTHING puede devolver 0 filas si ya existía.
+	// No es un error: el log ya está registrado.
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
 	if err != nil {
 		return apperr.Internal(fmt.Errorf("insert transaction log: %w", err))
 	}

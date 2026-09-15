@@ -247,6 +247,17 @@ func (s *Service) getActiveUser(ctx context.Context, userID string) (*models.Use
 }
 
 // executeTransfer ejecuta la transferencia en TB y registra el log.
+//
+// Si TB rechaza la transferencia, devuelve el error (la operación NO
+// se realizó).
+//
+// Si TB acepta pero InsertTransactionLog falla, se loggea el error y
+// se devuelve éxito. La fuente de verdad es TigerBeetle: la
+// transferencia SÍ se hizo. El log es un índice de lectura secundario.
+//
+// Después del insert, se llama FillHex para que la respuesta JSON
+// incluya los campos derivados (debit_account_id, credit_account_id
+// en formato hex).
 func (s *Service) executeTransfer(ctx context.Context, tx *models.Transaction) error {
 	transferID, err := s.tb.CreateTransfer(tx)
 	if err != nil {
@@ -260,10 +271,10 @@ func (s *Service) executeTransfer(ctx context.Context, tx *models.Transaction) e
 		// No devolvemos error: el dinero ya se movió.
 	}
 
+	// Llenar los campos hex para que la respuesta JSON sea completa.
+	tx.FillHex()
 	return nil
-}
-
-// validateAmount valida que el monto sea positivo.
+} // validateAmount valida que el monto sea positivo.
 func validateAmount(amountCents int64) error {
 	if amountCents <= 0 {
 		return apperr.BadRequest("INVALID_AMOUNT", "El monto debe ser mayor a cero")
