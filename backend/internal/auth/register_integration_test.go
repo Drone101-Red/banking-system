@@ -16,7 +16,10 @@ import (
 	"banking-system/internal/tigerbeetle"
 )
 
-// newTestEnv crea las dependencias reales para los tests de integración.
+// testJWTSecret es el secret dummy usado por los tests de integración.
+// NO es seguro, es solo para tests. No usar en producción.
+const testJWTSecret = "934d21db7326f4f86164171b2d523f33f0da6e64488a3efe8d542288767e3aa3"
+
 func newTestEnv(t *testing.T) (*auth.Service, *db.PostgresStore) {
 	t.Helper()
 
@@ -41,8 +44,7 @@ func newTestEnv(t *testing.T) (*auth.Service, *db.PostgresStore) {
 	}
 	t.Cleanup(func() { tbClient.Close() })
 
-	// Secret y expiry dummy: los tests de register no usan JWT.
-	service := auth.NewService(pg, tbClient, "7t3ZZZ0nIVIS3Cb5zQP3S8x+ui0JjYUZ1nhCcimh3AM=", time.Hour)
+	service := auth.NewService(pg, tbClient, testJWTSecret, time.Hour)
 	return service, pg
 }
 
