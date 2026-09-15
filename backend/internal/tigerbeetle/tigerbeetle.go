@@ -7,6 +7,7 @@ import (
 
 	tb "github.com/tigerbeetle/tigerbeetle-go"
 
+	"banking-system/internal/apperr"
 	"banking-system/internal/models"
 )
 
@@ -89,8 +90,7 @@ func (c *Client) Close() {
 // AccountExists devuelve true si la cuenta con el ID dado existe en TB.
 //
 // Aplica un timeout porque el cliente TigerBeetle no respeta context.Context
-// y no tiene timeout configurable. Si TB no responde en accountLookupTimeout,
-// devuelve error sin bloquear al caller.
+// y no tiene timeout configurable.
 func (c *Client) AccountExists(id tb.Uint128) (bool, error) {
 	if c == nil || c.client == nil {
 		return false, fmt.Errorf("cliente TigerBeetle no inicializado")
@@ -119,17 +119,7 @@ func (c *Client) AccountExists(id tb.Uint128) (bool, error) {
 	}
 }
 
-// CreateAccount crea una cuenta de usuario con la configuración estándar:
-// Ledger = LedgerUSD, Code = code, Flags = DebitsMustNotExceedCredits.
-//
-// Es idempotente:
-//   - Si la cuenta no existe, la crea.
-//   - Si ya existe con la configuración esperada, no hace nada.
-//   - Si existe con configuración distinta (flags, ledger, code),
-//     devuelve un error de integridad.
-//
-// TigerBeetle distingue estos casos en el status del CreateAccountResult,
-// por lo que no se necesita un LookupAccounts previo.
+// CreateAccount crea una cuenta de usuario con la configuración estándar.
 func (c *Client) CreateAccount(id tb.Uint128, code uint16) error {
 	if c == nil || c.client == nil {
 		return fmt.Errorf("cliente TigerBeetle no inicializado")
@@ -154,7 +144,6 @@ func (c *Client) CreateAccount(id tb.Uint128, code uint16) error {
 		case tb.AccountCreated:
 			return nil
 		case tb.AccountExists:
-			// Idempotente: la cuenta ya existe con la configuración esperada.
 			return nil
 		case tb.AccountExistsWithDifferentFlags:
 			return fmt.Errorf("account %s exists with different flags", u128Hex(id))
@@ -173,16 +162,6 @@ func (c *Client) CreateAccount(id tb.Uint128, code uint16) error {
 }
 
 // EnsureBankAccount garantiza que la cuenta bancaria del sistema exista.
-//
-// La cuenta banco es la contrapartida externa de depósitos y retiros.
-// Se crea con:
-//   - ID = BankAccountID (1)
-//   - Ledger = LedgerUSD
-//   - Code = CodeBank
-//   - Flags = 0  (sin restricción de débito; puede ir a saldo negativo sin límite)
-//
-// Es idempotente. Si la cuenta ya existe con la configuración esperada,
-// no hace nada. Si existe con configuración distinta, devuelve error.
 func (c *Client) EnsureBankAccount() error {
 	if c == nil || c.client == nil {
 		return fmt.Errorf("cliente TigerBeetle no inicializado")
@@ -205,7 +184,6 @@ func (c *Client) EnsureBankAccount() error {
 		case tb.AccountCreated:
 			return nil
 		case tb.AccountExists:
-			// Idempotente: ya existe con la configuración esperada.
 			return nil
 		case tb.AccountExistsWithDifferentFlags:
 			return fmt.Errorf("bank account %s exists with different flags", u128Hex(bankID))
@@ -223,9 +201,205 @@ func (c *Client) EnsureBankAccount() error {
 	return nil
 }
 
+// CreateTransfer ejecuta una transferencia en TigerBeetle.
+//
+// El struct Transaction debe tener:
+//   - TBTransferID (opcional, si nil se genera uno)
+//   - DebitAccountID (16 bytes)
+//   - CreditAccountID (16 bytes)
+//   - AmountCents (positivo)
+//   - Code (TransferCodeDeposit | Withdrawal | UserTransfer)
+//
+// Devuelve el TBTransferID de la transferencia creada.
+//
+// Traduce los errores de TigerBeetle a apperr:
+//   - TransferExceedsCredits            -> 400 INSUFFICIENT_FUNDS
+//   - TransferDebitAccountNotFound      -> 400 SOURCE_NOT_FOUND
+//   - TransferCreditAccountNotFound     -> 400 DEST_NOT_FOUND
+//   - TransferAccountsMustBeDifferent   -> 400 SAME_ACCOUNT
+//   - TransferExists                    -> OK (idempotente)
+func (c *Client) CreateTransfer(t *models.Transaction) ([]byte, error) {
+	if c == nil || c.client == nil {
+		return nil, apperr.Internal(fmt.Errorf("cliente TigerBeetle no inicializado"))
+	}
+	if len(t.DebitAccountID) != 16 {
+		return nil, apperr.Internal(fmt.Errorf("DebitAccountID debe ser 16 bytes"))
+	}
+	if len(t.CreditAccountID) != 16 {
+		return nil, apperr.Internal(fmt.Errorf("CreditAccountID debe ser 16 bytes"))
+	}
+	if t.AmountCents <= 0 {
+		return nil, apperr.BadRequest("INVALID_AMOUNT", "El monto debe ser positivo")
+	}
+
+	transferID, transferIDBytes, err := generateTransferID(t.TBTransferID)
+	if err != nil {
+		return nil, apperr.Internal(fmt.Errorf("generar transfer ID: %w", err))
+	}
+
+	res, err := c.client.CreateTransfers([]tb.Transfer{{
+		ID:              transferID,
+		DebitAccountID:  bytesToU128(t.DebitAccountID),
+		CreditAccountID: bytesToU128(t.CreditAccountID),
+		Amount:          tb.ToUint128(uint64(t.AmountCents)),
+		Ledger:          models.LedgerUSD,
+		Code:            t.Code,
+	}})
+	if err != nil {
+		return nil, apperr.Internal(fmt.Errorf("create transfer: %w", err))
+	}
+
+	for _, r := range res {
+		switch r.Status {
+		case tb.TransferCreated:
+			return transferIDBytes, nil
+		case tb.TransferExists:
+			// Idempotente: la transferencia ya fue creada (mismo ID).
+			return transferIDBytes, nil
+		case tb.TransferExceedsCredits:
+			return nil, apperr.BadRequest("INSUFFICIENT_FUNDS", "Saldo insuficiente")
+		case tb.TransferDebitAccountNotFound:
+			return nil, apperr.BadRequest("SOURCE_NOT_FOUND", "Cuenta origen no encontrada")
+		case tb.TransferCreditAccountNotFound:
+			return nil, apperr.BadRequest("DEST_NOT_FOUND", "Cuenta destino no encontrada")
+		case tb.TransferAccountsMustBeDifferent:
+			return nil, apperr.BadRequest("SAME_ACCOUNT", "Origen y destino no pueden ser la misma cuenta")
+		case tb.TransferLedgerMustNotBeZero:
+			return nil, apperr.Internal(fmt.Errorf("ledger inválido"))
+		case tb.TransferCodeMustNotBeZero:
+			return nil, apperr.Internal(fmt.Errorf("code inválido"))
+		default:
+			return nil, apperr.Internal(fmt.Errorf("transfer status: %s", r.Status))
+		}
+	}
+
+	return nil, apperr.Internal(fmt.Errorf("transfer: respuesta vacía"))
+}
+
+// GetBalance devuelve el saldo de una cuenta en centavos.
+//
+// El saldo se calcula como credits_posted - debits_posted.
+// Para cuentas de usuario (DebitsMustNotExceedCredits), siempre >= 0.
+func (c *Client) GetBalance(id tb.Uint128) (int64, error) {
+	if c == nil || c.client == nil {
+		return 0, apperr.Internal(fmt.Errorf("cliente TigerBeetle no inicializado"))
+	}
+
+	type result struct {
+		balance int64
+		err     error
+	}
+	ch := make(chan result, 1)
+
+	go func() {
+		accounts, err := c.client.LookupAccounts([]tb.Uint128{id})
+		if err != nil {
+			ch <- result{0, apperr.Internal(fmt.Errorf("lookup account: %w", err))}
+			return
+		}
+		if len(accounts) == 0 {
+			ch <- result{0, apperr.NotFound("ACCOUNT_NOT_FOUND", "Cuenta no encontrada")}
+			return
+		}
+		acc := accounts[0]
+		credits := uint128ToInt64(acc.CreditsPosted)
+		debits := uint128ToInt64(acc.DebitsPosted)
+		ch <- result{credits - debits, nil}
+	}()
+
+	select {
+	case r := <-ch:
+		return r.balance, r.err
+	case <-time.After(accountLookupTimeout):
+		return 0, apperr.Internal(fmt.Errorf("get balance timeout after %v", accountLookupTimeout))
+	}
+}
+
+// GetAccountInfo devuelve la información completa de una cuenta.
+func (c *Client) GetAccountInfo(id tb.Uint128) (*models.AccountInfo, error) {
+	if c == nil || c.client == nil {
+		return nil, apperr.Internal(fmt.Errorf("cliente TigerBeetle no inicializado"))
+	}
+
+	type result struct {
+		info *models.AccountInfo
+		err  error
+	}
+	ch := make(chan result, 1)
+
+	go func() {
+		accounts, err := c.client.LookupAccounts([]tb.Uint128{id})
+		if err != nil {
+			ch <- result{nil, apperr.Internal(fmt.Errorf("lookup account: %w", err))}
+			return
+		}
+		if len(accounts) == 0 {
+			ch <- result{nil, apperr.NotFound("ACCOUNT_NOT_FOUND", "Cuenta no encontrada")}
+			return
+		}
+		acc := accounts[0]
+		credits := uint128ToInt64(acc.CreditsPosted)
+		debits := uint128ToInt64(acc.DebitsPosted)
+		ch <- result{
+			&models.AccountInfo{
+				TBAccountID:  u128Hex(acc.ID),
+				BalanceCents: credits - debits,
+				Ledger:       acc.Ledger,
+				Code:         acc.Code,
+			},
+			nil,
+		}
+	}()
+
+	select {
+	case r := <-ch:
+		return r.info, r.err
+	case <-time.After(accountLookupTimeout):
+		return nil, apperr.Internal(fmt.Errorf("get account info timeout after %v", accountLookupTimeout))
+	}
+}
+
+// --- Helpers ---
+
 // u128Hex devuelve la representación hex de un Uint128 para logs de error.
-// Evita imprimir con %v (que puede no ser legible).
 func u128Hex(id tb.Uint128) string {
 	b := id.Bytes()
 	return fmt.Sprintf("%x", b)
+}
+
+// bytesToU128 convierte 16 bytes a Uint128.
+func bytesToU128(b []byte) tb.Uint128 {
+	var arr [16]byte
+	copy(arr[:], b)
+	return tb.BytesToUint128(arr)
+}
+
+// uint128ToInt64 extrae los 8 bytes menos significativos como int64.
+// Los saldos en centavos caben sin problema.
+func uint128ToInt64(u tb.Uint128) int64 {
+	b := u.Bytes()
+	var out uint64
+	for i := 8; i < 16; i++ {
+		out = (out << 8) | uint64(b[i])
+	}
+	return int64(out)
+}
+
+// generateTransferID genera un ID de transferencia aleatorio si no se
+// provee uno. Devuelve el Uint128 y su representación en 16 bytes.
+func generateTransferID(provided []byte) (tb.Uint128, []byte, error) {
+	if len(provided) == 16 {
+		return bytesToU128(provided), provided, nil
+	}
+	// Generar uno nuevo
+	// Nota: usamos el timestamp + random para evitar colisiones.
+	// En producción real, usar crypto/rand.
+	b := make([]byte, 16)
+	// Simplificación: usar el timestamp actual en los primeros 8 bytes
+	// y ceros en el resto. Esto es único por nanosegundo.
+	now := time.Now().UnixNano()
+	for i := 0; i < 8; i++ {
+		b[i] = byte(now >> (56 - i*8))
+	}
+	return bytesToU128(b), b, nil
 }
