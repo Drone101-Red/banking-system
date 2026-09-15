@@ -16,6 +16,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	tb "github.com/tigerbeetle/tigerbeetle-go"
 
+	"banking-system/internal/account"
 	"banking-system/internal/auth"
 	"banking-system/internal/db"
 	"banking-system/internal/models"
@@ -84,6 +85,8 @@ func main() {
 
 	txnService := transactions.NewService(pg, tbClient)
 	txnHandler := transactions.NewHandler(txnService)
+	acctService := account.NewService(pg, tbClient)
+	acctHandler := account.NewHandler(acctService)
 
 	// Reconciliador
 	reconciler := recovery.NewReconciler(pg, tbClient)
@@ -97,7 +100,6 @@ func main() {
 	r.Use(middleware.Timeout(10 * time.Second))
 
 	r.Get("/health", healthHandler(pg, tbClient))
-
 	// Rutas de auth
 	r.Route("/api/auth", func(r chi.Router) {
 		r.Post("/register", authHandler.RegisterHandler)
@@ -110,6 +112,7 @@ func main() {
 		})
 	})
 
+	// Rutas de transacciones (requieren JWT)
 	r.Route("/api/transactions", func(r chi.Router) {
 		r.Use(auth.RequireAuth(jwtSecret))
 		r.Post("/deposit", txnHandler.DepositHandler)
@@ -118,6 +121,12 @@ func main() {
 		r.Get("/history", txnHandler.HistoryHandler)
 	})
 
+	// Rutas de cuenta (requieren JWT)
+	r.Group(func(r chi.Router) {
+		r.Use(auth.RequireAuth(jwtSecret))
+		r.Get("/api/account", acctHandler.InfoHandler)
+		r.Get("/api/account/balance", acctHandler.BalanceHandler)
+	})
 	srv := &http.Server{
 		Addr:         ":" + port,
 		Handler:      r,
