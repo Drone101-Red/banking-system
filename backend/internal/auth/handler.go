@@ -85,18 +85,26 @@ func (h *Handler) LoginHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// LogoutHandler maneja POST /api/auth/logout.
+//
+// En un sistema JWT stateless, el logout es responsabilidad del cliente:
+// debe borrar el token. El backend no mantiene una blacklist.
+//
+// Este endpoint existe por completitud del contrato y para que el
+// frontend pueda llamarlo sin errores 404.
+//
+// Es idempotente: llamarlo con o sin token, válido o expirado,
+// siempre devuelve 204.
+func (h *Handler) LogoutHandler(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // MeHandler maneja GET /api/auth/me.
 //
-// Requiere el middleware RequireAuth corriendo antes. Lee el UserID y
-// el TBAccountID del context y hace un lookup en PostgreSQL para
-// devolver los datos actuales del usuario.
-//
-// Si el usuario no existe en PG (por ejemplo, fue eliminado después
-// de emitir el token), devuelve 404.
+// Requiere el middleware RequireAuth corriendo antes.
 func (h *Handler) MeHandler(w http.ResponseWriter, r *http.Request) {
 	userID, ok := UserIDFromContext(r.Context())
 	if !ok {
-		// No debería pasar si el middleware corrió antes.
 		apperr.Write(w, apperr.Unauthorized(
 			"TOKEN_REQUIRED",
 			"Se requiere autenticación",

@@ -98,6 +98,8 @@ func main() {
 	r.Route("/api/auth", func(r chi.Router) {
 		r.Post("/register", authHandler.RegisterHandler)
 		r.Post("/login", authHandler.LoginHandler)
+		r.Post("/logout", authHandler.LogoutHandler)
+
 		r.Group(func(r chi.Router) {
 			r.Use(auth.RequireAuth(jwtSecret))
 			r.Get("/me", authHandler.MeHandler)
