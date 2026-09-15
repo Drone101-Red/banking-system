@@ -6,11 +6,15 @@ CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 -- Estados:
 --   PENDING: usuario creado, cuenta TigerBeetle aún no confirmada
 --   ACTIVE:  usuario operativo, cuenta TigerBeetle confirmada
+--
+-- alias: identificador corto para transferencias (ej: "juan", "maria2").
+--        Único, generado automáticamente en el registro.
 CREATE TABLE IF NOT EXISTS users (
     id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     email         VARCHAR(255) UNIQUE NOT NULL,
     password_hash VARCHAR(255) NOT NULL,
     full_name     VARCHAR(255) NOT NULL,
+    alias         VARCHAR(50) UNIQUE NOT NULL,
     tb_account_id BYTEA NOT NULL UNIQUE,
     status        VARCHAR(20) NOT NULL DEFAULT 'PENDING'
                   CHECK (status IN ('PENDING', 'ACTIVE')),
@@ -19,12 +23,11 @@ CREATE TABLE IF NOT EXISTS users (
 );
 
 CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+CREATE INDEX IF NOT EXISTS idx_users_alias ON users(alias);
 CREATE INDEX IF NOT EXISTS idx_users_tb_account_id ON users(tb_account_id);
 CREATE INDEX IF NOT EXISTS idx_users_status ON users(status);
 
 -- Índice de lectura para el historial.
--- La verdad financiera está en TigerBeetle; esta tabla es solo un índice
--- de lectura para responder /history rápido sin paginar el ledger completo.
 CREATE TABLE IF NOT EXISTS transactions_log (
     id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     tb_transfer_id    BYTEA NOT NULL UNIQUE,
@@ -40,10 +43,6 @@ CREATE INDEX IF NOT EXISTS idx_txlog_credit  ON transactions_log(credit_account_
 CREATE INDEX IF NOT EXISTS idx_txlog_created ON transactions_log(created_at DESC);
 
 -- Operaciones pendientes de confirmación (chat IA).
---
--- El backend NO ejecuta operaciones de escritura sin un token válido
--- de esta tabla. Evita que el modelo ejecute transferencias sin
--- confirmación explícita del usuario.
 CREATE TABLE IF NOT EXISTS pending_confirmations (
     token         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id       UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,

@@ -165,9 +165,6 @@ func TestValidateLogin_EmptyPassword(t *testing.T) {
 }
 
 func TestValidateLogin_NoEmailFormatValidation(t *testing.T) {
-	// validateLogin NO valida formato del email (eso se resuelve con el
-	// lookup). Acepta emails mal formados; el login fallará con
-	// INVALID_CREDENTIALS.
 	req := LoginRequest{
 		Email:    "noesunemail",
 		Password: "TestPassword123!",

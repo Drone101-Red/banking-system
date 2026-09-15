@@ -15,6 +15,11 @@ import (
 	"banking-system/internal/models"
 )
 
+const (
+	// DemoTopupAmountCents es el monto del crédito de demo ($1000).
+	DemoTopupAmountCents int64 = 100_000
+)
+
 // TBClient abstrae las operaciones de TigerBeetle.
 type TBClient interface {
 	AccountExists(id tb.Uint128) (bool, error)
@@ -36,20 +41,15 @@ func NewService(pg *db.PostgresStore, tb TBClient) *Service {
 
 // --- Requests / Results ---
 
-// TransferRequest es el DTO de entrada de POST /api/transactions/deposit
-// y /withdraw.
 type TransferRequest struct {
 	AmountCents int64 `json:"amount_cents"`
 }
 
-// UserTransferRequest es el DTO de entrada de
-// POST /api/transactions/transfer.
 type UserTransferRequest struct {
 	ToAccountID string `json:"to_account_id"`
 	AmountCents int64  `json:"amount_cents"`
 }
 
-// HistoryResult es la respuesta paginada del historial.
 type HistoryResult struct {
 	Transactions []*models.Transaction `json:"transactions"`
 	Total        int                   `json:"total"`
@@ -58,12 +58,47 @@ type HistoryResult struct {
 	TotalPages   int                   `json:"total_pages"`
 }
 
+// DemoTopupResult es la respuesta de POST /api/transactions/demo-topup.
+type DemoTopupResult struct {
+	AmountCents int64               `json:"amount_cents"`
+	Message     string              `json:"message"`
+	Transaction *models.Transaction `json:"transaction"`
+}
+
 // --- Operaciones ---
 
-// Deposit agrega fondos a la cuenta del usuario.
+// DemoTopup carga un crédito de demo de $1000.
 //
-// idempotencyKey es opcional. Si se provee, el TBTransferID se deriva
-// determinísticamente del key. Reintentos con el mismo key son seguros.
+// Solo disponible en APP_ENV=development.
+func (s *Service) DemoTopup(ctx context.Context, userID string) (*DemoTopupResult, error) {
+	user, err := s.getActiveUser(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+
+	bankID := tb.ToUint128(models.BankAccountID)
+	userTBID := userTBAccountID(user)
+
+	tx := &models.Transaction{
+		DebitAccountID:  u128ToBytes(bankID),
+		CreditAccountID: u128ToBytes(userTBID),
+		AmountCents:     DemoTopupAmountCents,
+		Code:            models.TransferCodeDeposit,
+		IdempotencyKey:  deriveIdempotencyKey(userID, "demo-topup"),
+	}
+
+	if err := s.executeTransfer(ctx, tx); err != nil {
+		return nil, err
+	}
+
+	return &DemoTopupResult{
+		AmountCents: DemoTopupAmountCents,
+		Message:     "Crédito de demo cargado",
+		Transaction: tx,
+	}, nil
+}
+
+// Deposit agrega fondos a la cuenta del usuario.
 func (s *Service) Deposit(
 	ctx context.Context,
 	userID string,
@@ -213,10 +248,6 @@ func (s *Service) History(ctx context.Context, userID string, page, limit int) (
 
 // --- Helpers ---
 
-// deriveIdempotencyKey combina el userID con la key del cliente.
-//
-// Incluir el userID evita que dos usuarios distintos con la misma
-// idempotencyKey generen el mismo TBTransferID.
 func deriveIdempotencyKey(userID, clientKey string) string {
 	if clientKey == "" {
 		return ""
@@ -228,7 +259,6 @@ func deriveIdempotencyKey(userID, clientKey string) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// getActiveUser busca un usuario y valida que esté ACTIVE.
 func (s *Service) getActiveUser(ctx context.Context, userID string) (*models.User, error) {
 	user, err := s.pg.GetUserByID(ctx, userID)
 	if err != nil {
@@ -240,7 +270,6 @@ func (s *Service) getActiveUser(ctx context.Context, userID string) (*models.Use
 	return user, nil
 }
 
-// executeTransfer ejecuta la transferencia en TB y registra el log.
 func (s *Service) executeTransfer(ctx context.Context, tx *models.Transaction) error {
 	transferID, err := s.tb.CreateTransfer(tx)
 	if err != nil {
@@ -257,7 +286,6 @@ func (s *Service) executeTransfer(ctx context.Context, tx *models.Transaction) e
 	return nil
 }
 
-// validateAmount valida que el monto sea positivo.
 func validateAmount(amountCents int64) error {
 	if amountCents <= 0 {
 		return apperr.BadRequest("INVALID_AMOUNT", "El monto debe ser mayor a cero")
@@ -265,7 +293,6 @@ func validateAmount(amountCents int64) error {
 	return nil
 }
 
-// parseHex16 decodifica un string hex de 32 caracteres a 16 bytes.
 func parseHex16(s string) ([]byte, error) {
 	s = strings.TrimSpace(strings.ToLower(s))
 	if len(s) != 32 {
@@ -281,20 +308,17 @@ func parseHex16(s string) ([]byte, error) {
 	return b, nil
 }
 
-// userTBAccountID devuelve el Uint128 del user.
 func userTBAccountID(u *models.User) tb.Uint128 {
 	var arr [16]byte
 	copy(arr[:], u.TBAccountID)
 	return tb.BytesToUint128(arr)
 }
 
-// u128ToBytes convierte un Uint128 a 16 bytes.
 func u128ToBytes(id tb.Uint128) []byte {
 	b := id.Bytes()
 	return b[:]
 }
 
-// bytesEqual compara dos slices de bytes.
 func bytesEqual(a, b []byte) bool {
 	if len(a) != len(b) {
 		return false

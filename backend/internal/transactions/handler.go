@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"os"
 	"strconv"
 
 	"banking-system/internal/apperr"
@@ -121,6 +122,33 @@ func (h *Handler) HistoryHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, result)
+}
+
+// DemoTopupHandler maneja POST /api/transactions/demo-topup.
+//
+// Solo disponible en APP_ENV=development.
+func (h *Handler) DemoTopupHandler(w http.ResponseWriter, r *http.Request) {
+	if os.Getenv("APP_ENV") != "development" {
+		apperr.Write(w, apperr.Forbidden(
+			"DEMO_DISABLED",
+			"El crédito de demo solo está disponible en desarrollo",
+		))
+		return
+	}
+
+	userID, ok := auth.UserIDFromContext(r.Context())
+	if !ok {
+		apperr.Write(w, apperr.Unauthorized("TOKEN_REQUIRED", "Se requiere autenticación"))
+		return
+	}
+
+	result, err := h.service.DemoTopup(r.Context(), userID)
+	if err != nil {
+		apperr.Write(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, result)
 }
 
 // --- Helpers ---

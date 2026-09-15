@@ -17,14 +17,10 @@ const (
 	pgMaxOpenConns = 20
 	pgMaxIdleConns = 5
 
-	// pgConnectionAttempts y pgConnectionRetryDelay controlan el retry
-	// inicial de conexión. Postgres puede pasar el healthcheck antes de
-	// aceptar conexiones reales del cliente, por eso reintentamos.
 	pgConnectionAttempts   = 10
 	pgConnectionRetryDelay = 1 * time.Second
 )
 
-// Código PostgreSQL de violación de UNIQUE constraint.
 const pgUniqueViolation = "23505"
 
 type PostgresStore struct {
@@ -46,7 +42,6 @@ func NewPostgresStore(dsn string) (*PostgresStore, error) {
 		} else {
 			lastErr = err
 		}
-
 		if attempt < pgConnectionAttempts {
 			time.Sleep(pgConnectionRetryDelay)
 		}
@@ -55,8 +50,7 @@ func NewPostgresStore(dsn string) (*PostgresStore, error) {
 	_ = db.Close()
 	return nil, fmt.Errorf(
 		"postgres no disponible después de %d intentos: %w",
-		pgConnectionAttempts,
-		lastErr,
+		pgConnectionAttempts, lastErr,
 	)
 }
 
@@ -66,19 +60,18 @@ func (s *PostgresStore) Ping(ctx context.Context) error {
 	return s.db.PingContext(ctx)
 }
 
-// --- Users ---
-
 // CreateUserPending inserta un usuario nuevo con status PENDING.
 func (s *PostgresStore) CreateUserPending(ctx context.Context, u *models.User) error {
 	const q = `
-		INSERT INTO users (email, password_hash, full_name, tb_account_id, status)
-		VALUES ($1, $2, $3, $4, $5)
+		INSERT INTO users (email, password_hash, full_name, alias, tb_account_id, status)
+		VALUES ($1, $2, $3, $4, $5, $6)
 		RETURNING id, created_at, updated_at`
 
 	err := s.db.QueryRowContext(ctx, q,
 		u.Email,
 		u.PasswordHash,
 		u.FullName,
+		u.Alias,
 		u.TBAccountID,
 		models.StatusPending,
 	).Scan(&u.ID, &u.CreatedAt, &u.UpdatedAt)
@@ -89,6 +82,8 @@ func (s *PostgresStore) CreateUserPending(ctx context.Context, u *models.User) e
 			switch pqErr.Constraint {
 			case "users_email_key":
 				return apperr.Conflict("EMAIL_EXISTS", "El email ya está registrado")
+			case "users_alias_key":
+				return apperr.Conflict("ALIAS_EXISTS", "El alias ya está en uso")
 			case "users_tb_account_id_key":
 				return apperr.Conflict("TB_ACCOUNT_ID_COLLISION", "Colisión de identificador financiero")
 			default:
@@ -105,7 +100,7 @@ func (s *PostgresStore) CreateUserPending(ctx context.Context, u *models.User) e
 // GetUserByEmail busca un usuario por email.
 func (s *PostgresStore) GetUserByEmail(ctx context.Context, email string) (*models.User, error) {
 	const q = `
-		SELECT id, email, password_hash, full_name, tb_account_id,
+		SELECT id, email, password_hash, full_name, alias, tb_account_id,
 		       status, created_at, updated_at
 		FROM users
 		WHERE email = $1`
@@ -116,7 +111,7 @@ func (s *PostgresStore) GetUserByEmail(ctx context.Context, email string) (*mode
 // GetUserByID busca un usuario por UUID.
 func (s *PostgresStore) GetUserByID(ctx context.Context, id string) (*models.User, error) {
 	const q = `
-		SELECT id, email, password_hash, full_name, tb_account_id,
+		SELECT id, email, password_hash, full_name, alias, tb_account_id,
 		       status, created_at, updated_at
 		FROM users
 		WHERE id = $1`
@@ -124,10 +119,21 @@ func (s *PostgresStore) GetUserByID(ctx context.Context, id string) (*models.Use
 	return s.scanUser(s.db.QueryRowContext(ctx, q, id))
 }
 
-// GetUserByTBAccountID busca un usuario por su tb_account_id (16 bytes).
+// GetUserByAlias busca un usuario por alias.
+func (s *PostgresStore) GetUserByAlias(ctx context.Context, alias string) (*models.User, error) {
+	const q = `
+		SELECT id, email, password_hash, full_name, alias, tb_account_id,
+		       status, created_at, updated_at
+		FROM users
+		WHERE alias = $1`
+
+	return s.scanUser(s.db.QueryRowContext(ctx, q, alias))
+}
+
+// GetUserByTBAccountID busca un usuario por su tb_account_id.
 func (s *PostgresStore) GetUserByTBAccountID(ctx context.Context, tbID []byte) (*models.User, error) {
 	const q = `
-		SELECT id, email, password_hash, full_name, tb_account_id,
+		SELECT id, email, password_hash, full_name, alias, tb_account_id,
 		       status, created_at, updated_at
 		FROM users
 		WHERE tb_account_id = $1`
@@ -169,7 +175,7 @@ func (s *PostgresStore) UpdateUserStatusActive(ctx context.Context, id string) e
 // ListPendingUsers devuelve hasta `limit` usuarios con status PENDING.
 func (s *PostgresStore) ListPendingUsers(ctx context.Context, limit int) ([]*models.User, error) {
 	const q = `
-		SELECT id, email, password_hash, full_name, tb_account_id,
+		SELECT id, email, password_hash, full_name, alias, tb_account_id,
 		       status, created_at, updated_at
 		FROM users
 		WHERE status = $1
@@ -186,14 +192,8 @@ func (s *PostgresStore) ListPendingUsers(ctx context.Context, limit int) ([]*mod
 	for rows.Next() {
 		var u models.User
 		if err := rows.Scan(
-			&u.ID,
-			&u.Email,
-			&u.PasswordHash,
-			&u.FullName,
-			&u.TBAccountID,
-			&u.Status,
-			&u.CreatedAt,
-			&u.UpdatedAt,
+			&u.ID, &u.Email, &u.PasswordHash, &u.FullName, &u.Alias,
+			&u.TBAccountID, &u.Status, &u.CreatedAt, &u.UpdatedAt,
 		); err != nil {
 			return nil, apperr.Internal(fmt.Errorf("scan pending user: %w", err))
 		}
@@ -205,20 +205,23 @@ func (s *PostgresStore) ListPendingUsers(ctx context.Context, limit int) ([]*mod
 	return out, nil
 }
 
+// AliasExists devuelve true si el alias ya está tomado.
+func (s *PostgresStore) AliasExists(ctx context.Context, alias string) (bool, error) {
+	const q = `SELECT 1 FROM users WHERE alias = $1`
+	var dummy int
+	err := s.db.QueryRowContext(ctx, q, alias).Scan(&dummy)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, apperr.Internal(fmt.Errorf("alias exists: %w", err))
+	}
+	return true, nil
+}
+
 // --- Transactions log ---
 
-// InsertTransactionLog guarda un índice de la transferencia para el
-// historial. La verdad financiera está en TigerBeetle.
-//
-// Es idempotente: si el tb_transfer_id ya existe (UNIQUE constraint),
-// el INSERT usa ON CONFLICT DO NOTHING.
-// InsertTransactionLog guarda un índice de la transferencia para el
-// historial. La verdad financiera está en TigerBeetle.
-//
-// Es idempotente: si el tb_transfer_id ya existe (UNIQUE constraint),
-// el INSERT usa ON CONFLICT DO NOTHING y no modifica el struct.
-//
-// Rellena t.ID y t.CreatedAt con los valores generados por PostgreSQL.
+// InsertTransactionLog guarda un índice de la transferencia.
 func (s *PostgresStore) InsertTransactionLog(ctx context.Context, t *models.Transaction) error {
 	const q = `
 		INSERT INTO transactions_log
@@ -235,8 +238,6 @@ func (s *PostgresStore) InsertTransactionLog(ctx context.Context, t *models.Tran
 		t.Code,
 	).Scan(&t.ID, &t.CreatedAt)
 
-	// ON CONFLICT DO NOTHING puede devolver 0 filas si ya existía.
-	// No es un error: el log ya está registrado.
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
@@ -246,20 +247,14 @@ func (s *PostgresStore) InsertTransactionLog(ctx context.Context, t *models.Tran
 	return nil
 }
 
-// ListTransactions devuelve el historial paginado que involucra a
-// tbAccountID (como debit o credit). Ordenado por created_at DESC.
-//
-// Devuelve (transacciones, total, error). El total es para que el
-// handler pueda calcular páginas.
+// ListTransactions devuelve el historial paginado.
 func (s *PostgresStore) ListTransactions(
 	ctx context.Context,
 	tbAccountID []byte,
 	limit, offset int,
 ) ([]*models.Transaction, int, error) {
-	// Total para paginación
 	const countQ = `
-		SELECT COUNT(*)
-		FROM transactions_log
+		SELECT COUNT(*) FROM transactions_log
 		WHERE debit_account_id = $1 OR credit_account_id = $1`
 
 	var total int
@@ -267,7 +262,6 @@ func (s *PostgresStore) ListTransactions(
 		return nil, 0, apperr.Internal(fmt.Errorf("count transactions: %w", err))
 	}
 
-	// Página
 	const listQ = `
 		SELECT id, tb_transfer_id, debit_account_id, credit_account_id,
 		       amount_cents, code, created_at
@@ -286,13 +280,8 @@ func (s *PostgresStore) ListTransactions(
 	for rows.Next() {
 		var t models.Transaction
 		if err := rows.Scan(
-			&t.ID,
-			&t.TBTransferID,
-			&t.DebitAccountID,
-			&t.CreditAccountID,
-			&t.AmountCents,
-			&t.Code,
-			&t.CreatedAt,
+			&t.ID, &t.TBTransferID, &t.DebitAccountID, &t.CreditAccountID,
+			&t.AmountCents, &t.Code, &t.CreatedAt,
 		); err != nil {
 			return nil, 0, apperr.Internal(fmt.Errorf("scan transaction: %w", err))
 		}
@@ -306,46 +295,9 @@ func (s *PostgresStore) ListTransactions(
 	return out, total, nil
 }
 
-// --- Helpers ---
-
-// userExists devuelve true si existe un usuario con el ID dado.
-func (s *PostgresStore) userExists(ctx context.Context, id string) (bool, error) {
-	const q = `SELECT 1 FROM users WHERE id = $1`
-	var dummy int
-	err := s.db.QueryRowContext(ctx, q, id).Scan(&dummy)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
-	if err != nil {
-		return false, apperr.Internal(fmt.Errorf("user exists: %w", err))
-	}
-	return true, nil
-}
-
-// scanUser escanea una fila de users a un models.User.
-func (s *PostgresStore) scanUser(row *sql.Row) (*models.User, error) {
-	var u models.User
-	err := row.Scan(
-		&u.ID,
-		&u.Email,
-		&u.PasswordHash,
-		&u.FullName,
-		&u.TBAccountID,
-		&u.Status,
-		&u.CreatedAt,
-		&u.UpdatedAt,
-	)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, apperr.NotFound("USER_NOT_FOUND", "Usuario no encontrado")
-	}
-	if err != nil {
-		return nil, apperr.Internal(fmt.Errorf("scan user: %w", err))
-	}
-	return &u, nil
-}
+// --- Pending confirmations ---
 
 // SavePendingConfirmation guarda una operación pendiente de confirmación.
-// Devuelve el token generado.
 func (s *PostgresStore) SavePendingConfirmation(
 	ctx context.Context,
 	userID string,
@@ -366,8 +318,7 @@ func (s *PostgresStore) SavePendingConfirmation(
 	return token, exp, nil
 }
 
-// ConsumePendingConfirmation recupera y marca como usada una
-// operación pendiente. Devuelve el operation JSONB y el userID.
+// ConsumePendingConfirmation recupera y marca como usada una operación pendiente.
 func (s *PostgresStore) ConsumePendingConfirmation(
 	ctx context.Context,
 	token, userID string,
@@ -393,4 +344,34 @@ func (s *PostgresStore) ConsumePendingConfirmation(
 		return nil, apperr.Internal(fmt.Errorf("consume pending confirmation: %w", err))
 	}
 	return operationJSON, nil
+}
+
+// --- Helpers ---
+
+func (s *PostgresStore) userExists(ctx context.Context, id string) (bool, error) {
+	const q = `SELECT 1 FROM users WHERE id = $1`
+	var dummy int
+	err := s.db.QueryRowContext(ctx, q, id).Scan(&dummy)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, apperr.Internal(fmt.Errorf("user exists: %w", err))
+	}
+	return true, nil
+}
+
+func (s *PostgresStore) scanUser(row *sql.Row) (*models.User, error) {
+	var u models.User
+	err := row.Scan(
+		&u.ID, &u.Email, &u.PasswordHash, &u.FullName, &u.Alias,
+		&u.TBAccountID, &u.Status, &u.CreatedAt, &u.UpdatedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, apperr.NotFound("USER_NOT_FOUND", "Usuario no encontrado")
+	}
+	if err != nil {
+		return nil, apperr.Internal(fmt.Errorf("scan user: %w", err))
+	}
+	return &u, nil
 }

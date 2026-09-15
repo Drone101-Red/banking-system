@@ -1,4 +1,3 @@
-// Package auth implementa el registro, login y gestión de sesiones.
 package auth
 
 import (
@@ -8,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
 
 	tb "github.com/tigerbeetle/tigerbeetle-go"
 
@@ -17,12 +17,6 @@ import (
 	"banking-system/internal/password"
 )
 
-// dummyPasswordHash es un hash bcrypt cost 12 de una contraseña que nadie
-// conoce. Se usa para mitigar timing attacks en Login cuando el email no
-// existe: comparamos contra este hash para mantener el tiempo de respuesta
-// constante, y luego ignoramos el resultado.
-//
-// Ver docs/step3/3.6-login.md, decisión "timing attack mitigation".
 const dummyPasswordHash = "$2a$12$pHpHZ1qj/K0ErwbTaxyDrO2e8KYQRhlJWOWY7EXoKYUq443Wnqfsm"
 
 // RegisterRequest es el DTO de entrada de POST /api/auth/register.
@@ -36,6 +30,15 @@ type RegisterRequest struct {
 type LoginRequest struct {
 	Email    string `json:"email"`
 	Password string `json:"password"`
+}
+
+// UserLookup es la respuesta de GET /api/users/lookup.
+type UserLookup struct {
+	UserID      string `json:"user_id"`
+	Email       string `json:"email"`
+	FullName    string `json:"full_name"`
+	Alias       string `json:"alias"`
+	TBAccountID string `json:"tb_account_id"` // hex
 }
 
 // TBAccountCreator abstrae las operaciones que el service necesita de TB.
@@ -52,9 +55,6 @@ type Service struct {
 }
 
 // NewService construye el Service.
-//
-// Requiere el JWT secret y el expiry porque Login los necesita para
-// firmar tokens. No hay estado parcialmente inicializado.
 func NewService(pg *db.PostgresStore, tbClient TBAccountCreator, jwtSecret string, jwtExpiry time.Duration) *Service {
 	return &Service{
 		pg:        pg,
@@ -65,13 +65,16 @@ func NewService(pg *db.PostgresStore, tbClient TBAccountCreator, jwtSecret strin
 }
 
 // Register crea un usuario nuevo siguiendo el flujo PENDING -> ACTIVE.
-//
-// Ver docs/step3/3.5-register.md para el detalle.
 func (s *Service) Register(ctx context.Context, req RegisterRequest) (*models.User, error) {
 	email := strings.ToLower(strings.TrimSpace(req.Email))
 	fullName := strings.TrimSpace(req.FullName)
 
 	if err := validateRegister(req, email, fullName); err != nil {
+		return nil, err
+	}
+
+	alias, err := s.generateAlias(ctx, email)
+	if err != nil {
 		return nil, err
 	}
 
@@ -89,6 +92,7 @@ func (s *Service) Register(ctx context.Context, req RegisterRequest) (*models.Us
 		Email:        email,
 		PasswordHash: hash,
 		FullName:     fullName,
+		Alias:        alias,
 		TBAccountID:  tbIDBytes,
 	}
 	if err := s.pg.CreateUserPending(ctx, user); err != nil {
@@ -108,18 +112,6 @@ func (s *Service) Register(ctx context.Context, req RegisterRequest) (*models.Us
 }
 
 // Login autentica un usuario y devuelve un JWT.
-//
-// Contrato:
-//
-//	email vacío                              → 400 EMAIL_REQUIRED
-//	password vacía                           → 400 PASSWORD_REQUIRED
-//	email inexistente                        → 401 INVALID_CREDENTIALS
-//	password incorrecta                      → 401 INVALID_CREDENTIALS
-//	password correcta + status PENDING       → 401 ACCOUNT_PENDING
-//	password correcta + status ACTIVE        → 200 con user + JWT
-//
-// Los casos de credenciales inválidas son indistinguibles para el cliente:
-// ni el mensaje ni el timing revelan si el email existe.
 func (s *Service) Login(ctx context.Context, req LoginRequest) (*models.User, string, error) {
 	email := strings.ToLower(strings.TrimSpace(req.Email))
 
@@ -127,20 +119,16 @@ func (s *Service) Login(ctx context.Context, req LoginRequest) (*models.User, st
 		return nil, "", err
 	}
 
-	// Buscar usuario. Si no existe, mantenemos el timing constante con
-	// un bcrypt dummy y devolvemos el mismo error que "password incorrecta".
 	user, err := s.pg.GetUserByEmail(ctx, email)
 	if err != nil {
 		var appErr *apperr.AppError
 		if errors.As(err, &appErr) && appErr.Code == "USER_NOT_FOUND" {
-			// Timing attack mitigation.
 			_ = password.Compare(dummyPasswordHash, req.Password)
 			return nil, "", apperr.Unauthorized("INVALID_CREDENTIALS", "Credenciales inválidas")
 		}
 		return nil, "", err
 	}
 
-	// Verificar password.
 	if err := password.Compare(user.PasswordHash, req.Password); err != nil {
 		if errors.Is(err, password.ErrMismatch) {
 			return nil, "", apperr.Unauthorized("INVALID_CREDENTIALS", "Credenciales inválidas")
@@ -148,7 +136,6 @@ func (s *Service) Login(ctx context.Context, req LoginRequest) (*models.User, st
 		return nil, "", apperr.Internal(fmt.Errorf("comparar password: %w", err))
 	}
 
-	// Verificar status DESPUÉS de validar password.
 	if user.Status == models.StatusPending {
 		return nil, "", apperr.Unauthorized("ACCOUNT_PENDING", "Tu cuenta está siendo procesada")
 	}
@@ -156,7 +143,6 @@ func (s *Service) Login(ctx context.Context, req LoginRequest) (*models.User, st
 		return nil, "", apperr.Unauthorized("ACCOUNT_INVALID_STATUS", "Estado de cuenta inválido")
 	}
 
-	// Generar JWT.
 	token, err := GenerateToken(user, s.jwtSecret, s.jwtExpiry)
 	if err != nil {
 		return nil, "", apperr.Internal(fmt.Errorf("generar JWT: %w", err))
@@ -165,7 +151,98 @@ func (s *Service) Login(ctx context.Context, req LoginRequest) (*models.User, st
 	return user, token, nil
 }
 
-// validateRegister aplica las validaciones del request de registro.
+// LookupUser busca un usuario por email o alias.
+//
+// Exactamente uno de email o alias debe estar presente.
+//
+// Devuelve solo datos públicos. NO expone password_hash.
+func (s *Service) LookupUser(ctx context.Context, email, alias string) (*UserLookup, error) {
+	email = strings.ToLower(strings.TrimSpace(email))
+	alias = strings.ToLower(strings.TrimSpace(alias))
+
+	if email == "" && alias == "" {
+		return nil, apperr.BadRequest("MISSING_QUERY", "Se requiere email o alias")
+	}
+	if email != "" && alias != "" {
+		return nil, apperr.BadRequest("AMBIGUOUS_QUERY", "Solo email o alias, no ambos")
+	}
+
+	var (
+		user *models.User
+		err  error
+	)
+	if email != "" {
+		user, err = s.pg.GetUserByEmail(ctx, email)
+	} else {
+		user, err = s.pg.GetUserByAlias(ctx, alias)
+	}
+	if err != nil {
+		// Si no existe, devolver error específico de lookup
+		var appErr *apperr.AppError
+		if errors.As(err, &appErr) && appErr.Code == "USER_NOT_FOUND" {
+			return nil, apperr.NotFound("USER_NOT_FOUND", "Usuario no encontrado")
+		}
+		return nil, err
+	}
+
+	// Solo devolver usuarios ACTIVE
+	if user.Status != models.StatusActive {
+		return nil, apperr.NotFound("USER_NOT_FOUND", "Usuario no encontrado")
+	}
+
+	return &UserLookup{
+		UserID:      user.ID,
+		Email:       user.Email,
+		FullName:    user.FullName,
+		Alias:       user.Alias,
+		TBAccountID: hexEncode(user.TBAccountID),
+	}, nil
+}
+
+// generateAlias genera un alias único basado en el email.
+func (s *Service) generateAlias(ctx context.Context, email string) (string, error) {
+	local := email
+	if idx := strings.Index(email, "@"); idx > 0 {
+		local = email[:idx]
+	}
+
+	var cleaned strings.Builder
+	for _, r := range local {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '-' || r == '.' {
+			cleaned.WriteRune(unicode.ToLower(r))
+		}
+	}
+	base := cleaned.String()
+
+	if len(base) < 3 {
+		base = fmt.Sprintf("user-%d", time.Now().UnixNano()%10000)
+	}
+	if len(base) > 20 {
+		base = base[:20]
+	}
+
+	exists, err := s.pg.AliasExists(ctx, base)
+	if err != nil {
+		return "", err
+	}
+	if !exists {
+		return base, nil
+	}
+
+	for i := 2; i <= 100; i++ {
+		candidate := fmt.Sprintf("%s%d", base, i)
+		exists, err := s.pg.AliasExists(ctx, candidate)
+		if err != nil {
+			return "", err
+		}
+		if !exists {
+			return candidate, nil
+		}
+	}
+
+	return fmt.Sprintf("user-%d", time.Now().UnixNano()%100000), nil
+}
+
 func validateRegister(req RegisterRequest, email, fullName string) error {
 	if email == "" {
 		return apperr.BadRequest("EMAIL_REQUIRED", "El email es obligatorio")
@@ -190,11 +267,6 @@ func validateRegister(req RegisterRequest, email, fullName string) error {
 	return nil
 }
 
-// validateLogin aplica las validaciones del request de login.
-//
-// Deliberadamente laxas: solo verifica que los campos no estén vacíos.
-// La validación "dura" (email válido, password correcta) es la del login
-// en sí, y se resuelve con un único error genérico.
 func validateLogin(req LoginRequest, email string) error {
 	if email == "" {
 		return apperr.BadRequest("EMAIL_REQUIRED", "El email es obligatorio")
@@ -205,10 +277,6 @@ func validateLogin(req LoginRequest, email string) error {
 	return nil
 }
 
-// generateTBAccountID genera un uint128 aleatorio (crypto/rand) y su
-// representación en 16 bytes (big-endian).
-//
-// Rechaza los IDs 0 y 1 (reservados).
 func generateTBAccountID() (tb.Uint128, []byte, error) {
 	for {
 		var b [16]byte
@@ -221,4 +289,15 @@ func generateTBAccountID() (tb.Uint128, []byte, error) {
 		}
 		return id, b[:], nil
 	}
+}
+
+// hexEncode convierte bytes a hex string.
+func hexEncode(b []byte) string {
+	const hexChars = "0123456789abcdef"
+	out := make([]byte, len(b)*2)
+	for i, v := range b {
+		out[i*2] = hexChars[v>>4]
+		out[i*2+1] = hexChars[v&0x0f]
+	}
+	return string(out)
 }

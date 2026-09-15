@@ -44,6 +44,7 @@ func (h *Handler) RegisterHandler(w http.ResponseWriter, r *http.Request) {
 		"id":        user.ID,
 		"email":     user.Email,
 		"full_name": user.FullName,
+		"alias":     user.Alias,
 		"status":    user.Status,
 	}); err != nil {
 		log.Printf("[auth] error serializando respuesta register: %v", err)
@@ -78,6 +79,7 @@ func (h *Handler) LoginHandler(w http.ResponseWriter, r *http.Request) {
 			"id":        user.ID,
 			"email":     user.Email,
 			"full_name": user.FullName,
+			"alias":     user.Alias,
 			"status":    user.Status,
 		},
 	}); err != nil {
@@ -86,22 +88,11 @@ func (h *Handler) LoginHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // LogoutHandler maneja POST /api/auth/logout.
-//
-// En un sistema JWT stateless, el logout es responsabilidad del cliente:
-// debe borrar el token. El backend no mantiene una blacklist.
-//
-// Este endpoint existe por completitud del contrato y para que el
-// frontend pueda llamarlo sin errores 404.
-//
-// Es idempotente: llamarlo con o sin token, válido o expirado,
-// siempre devuelve 204.
 func (h *Handler) LogoutHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
 // MeHandler maneja GET /api/auth/me.
-//
-// Requiere el middleware RequireAuth corriendo antes.
 func (h *Handler) MeHandler(w http.ResponseWriter, r *http.Request) {
 	userID, ok := UserIDFromContext(r.Context())
 	if !ok {
@@ -124,8 +115,33 @@ func (h *Handler) MeHandler(w http.ResponseWriter, r *http.Request) {
 		"id":        user.ID,
 		"email":     user.Email,
 		"full_name": user.FullName,
+		"alias":     user.Alias,
 		"status":    user.Status,
 	}); err != nil {
 		log.Printf("[auth] error serializando respuesta me: %v", err)
+	}
+}
+
+// LookupHandler maneja GET /api/users/lookup.
+//
+// Query params:
+//   - email: buscar por email
+//   - alias: buscar por alias
+//
+// Exactamente uno de los dos debe estar presente.
+func (h *Handler) LookupHandler(w http.ResponseWriter, r *http.Request) {
+	email := r.URL.Query().Get("email")
+	alias := r.URL.Query().Get("alias")
+
+	result, err := h.service.LookupUser(r.Context(), email, alias)
+	if err != nil {
+		apperr.Write(w, err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(result); err != nil {
+		log.Printf("[auth] error serializando respuesta lookup: %v", err)
 	}
 }

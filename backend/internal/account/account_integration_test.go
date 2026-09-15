@@ -83,10 +83,17 @@ func createActiveUser(t *testing.T, env *testEnv, prefix string) *models.User {
 		t.Fatalf("password.Hash: %v", err)
 	}
 
+	ts := time.Now().UnixNano()
+	alias := fmt.Sprintf("%s-%d", prefix, ts)
+	if len(alias) > 50 {
+		alias = alias[:50]
+	}
+
 	u := &models.User{
-		Email:        fmt.Sprintf("%s-%d@test.local", prefix, time.Now().UnixNano()),
+		Email:        fmt.Sprintf("%s-%d@test.local", prefix, ts),
 		PasswordHash: hash,
 		FullName:     "Test User",
+		Alias:        alias,
 		TBAccountID:  b[:],
 	}
 	if err := env.pg.CreateUserPending(ctx, u); err != nil {
@@ -105,7 +112,6 @@ func createActiveUser(t *testing.T, env *testEnv, prefix string) *models.User {
 
 	return u
 }
-
 func TestAccountInfo_Integration(t *testing.T) {
 	env := newTestEnv(t)
 	ctx := context.Background()

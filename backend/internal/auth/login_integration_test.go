@@ -6,8 +6,10 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"banking-system/internal/auth"
 	"banking-system/internal/models"
@@ -24,7 +26,6 @@ func randomTBAccountIDBytes(t *testing.T) []byte {
 	if _, err := rand.Read(b[:]); err != nil {
 		t.Fatalf("rand.Read: %v", err)
 	}
-	// Asegurar que no sea 0 (reservado)
 	allZero := true
 	for _, x := range b {
 		if x != 0 {
@@ -38,7 +39,7 @@ func randomTBAccountIDBytes(t *testing.T) []byte {
 	return b[:]
 }
 
-// registerAndGetUser registra un usuario y devuelve el email y password
+// registerAndGetUser registra un usuario y devuelve email y password
 // para reusar en tests de login.
 func registerAndGetUser(t *testing.T, service *auth.Service) (string, string) {
 	t.Helper()
@@ -57,8 +58,6 @@ func registerAndGetUser(t *testing.T, service *auth.Service) (string, string) {
 	}
 	return email, pass
 }
-
-// --- Login ---
 
 func TestLogin_HappyPath(t *testing.T) {
 	service, _ := newTestEnv(t)
@@ -125,9 +124,6 @@ func TestLogin_PendingUser(t *testing.T) {
 	service, pg := newTestEnv(t)
 	ctx := context.Background()
 
-	// Crear usuario PENDING directamente con CreateUserPending.
-	// No creamos cuenta en TigerBeetle: el escenario PENDING real es
-	// exactamente este (usuario en PG, cuenta TB ausente).
 	email := uniqueEmail("pending")
 	pass := "TestPassword123!"
 
@@ -136,10 +132,17 @@ func TestLogin_PendingUser(t *testing.T) {
 		t.Fatalf("password.Hash: %v", err)
 	}
 
+	ts := time.Now().UnixNano()
+	alias := fmt.Sprintf("pending-%d", ts)
+	if len(alias) > 50 {
+		alias = alias[:50]
+	}
+
 	user := &models.User{
 		Email:        email,
 		PasswordHash: hash,
 		FullName:     "Pending User",
+		Alias:        alias,
 		TBAccountID:  randomTBAccountIDBytes(t),
 	}
 	if err := pg.CreateUserPending(ctx, user); err != nil {
@@ -206,7 +209,6 @@ func TestLogin_TokenIsValid(t *testing.T) {
 		t.Fatalf("Login: %v", err)
 	}
 
-	// Parsear el token con el mismo secret del newTestEnv.
 	claims, err := auth.ParseToken(token, testJWTSecret)
 	if err != nil {
 		t.Fatalf("ParseToken: %v", err)
@@ -242,7 +244,6 @@ func TestLogin_TokenHasCorrectClaims(t *testing.T) {
 		t.Fatalf("claims.UserID = %s, esperado %s", claims.UserID, user.ID)
 	}
 
-	// Verificar que el tb_account_id del claim coincide con el de PG.
 	fetched, err := pg.GetUserByID(ctx, user.ID)
 	if err != nil {
 		t.Fatalf("GetUserByID: %v", err)

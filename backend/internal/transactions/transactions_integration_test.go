@@ -90,10 +90,18 @@ func createActiveUser(t *testing.T, env *testEnv, prefix string) *models.User {
 		t.Fatalf("password.Hash: %v", err)
 	}
 
+	// Generar alias único (incluye timestamp)
+	ts := time.Now().UnixNano()
+	alias := fmt.Sprintf("%s-%d", prefix, ts)
+	if len(alias) > 50 {
+		alias = alias[:50]
+	}
+
 	u := &models.User{
-		Email:        fmt.Sprintf("%s-%d@test.local", prefix, time.Now().UnixNano()),
+		Email:        fmt.Sprintf("%s-%d@test.local", prefix, ts),
 		PasswordHash: hash,
 		FullName:     "Test User",
+		Alias:        alias,
 		TBAccountID:  b[:],
 	}
 	if err := env.pg.CreateUserPending(ctx, u); err != nil {
@@ -380,5 +388,61 @@ func TestTransfer_Idempotent_Integration(t *testing.T) {
 	}
 	if bobBalance != 3000 {
 		t.Fatalf("bob balance = %d, esperado 3000 (no duplicado)", bobBalance)
+	}
+}
+
+// --- DemoTopup ---
+
+func TestDemoTopup_Integration(t *testing.T) {
+	env := newTestEnv(t)
+	ctx := context.Background()
+
+	user := createActiveUser(t, env, "demotopup")
+
+	// Saldo inicial
+	initialBalance, _ := env.tb.GetBalance(tbIDFromBytes(user.TBAccountID))
+	if initialBalance != 0 {
+		t.Fatalf("saldo inicial = %d, esperado 0", initialBalance)
+	}
+
+	result, err := env.svc.DemoTopup(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("DemoTopup: %v", err)
+	}
+	if result.AmountCents != 100_000 {
+		t.Fatalf("amount = %d, esperado 100000", result.AmountCents)
+	}
+	if result.Transaction == nil {
+		t.Fatal("transaction nil")
+	}
+	if result.Transaction.Code != models.TransferCodeDeposit {
+		t.Fatalf("code = %d, esperado %d", result.Transaction.Code, models.TransferCodeDeposit)
+	}
+
+	// Saldo después
+	newBalance, _ := env.tb.GetBalance(tbIDFromBytes(user.TBAccountID))
+	if newBalance != 100_000 {
+		t.Fatalf("saldo = %d, esperado 100000", newBalance)
+	}
+}
+
+func TestDemoTopup_Idempotent(t *testing.T) {
+	env := newTestEnv(t)
+	ctx := context.Background()
+
+	user := createActiveUser(t, env, "demotopup-idem")
+
+	// Dos llamadas seguidas
+	if _, err := env.svc.DemoTopup(ctx, user.ID); err != nil {
+		t.Fatalf("primera DemoTopup: %v", err)
+	}
+	if _, err := env.svc.DemoTopup(ctx, user.ID); err != nil {
+		t.Fatalf("segunda DemoTopup: %v", err)
+	}
+
+	// El saldo debe ser 100_000, no 200_000
+	balance, _ := env.tb.GetBalance(tbIDFromBytes(user.TBAccountID))
+	if balance != 100_000 {
+		t.Fatalf("saldo = %d, esperado 100000 (idempotente)", balance)
 	}
 }

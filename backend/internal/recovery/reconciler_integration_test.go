@@ -90,10 +90,17 @@ func createPendingUser(t *testing.T, env *testEnv) (*models.User, tb.Uint128) {
 		t.Fatalf("password.Hash: %v", err)
 	}
 
+	ts := time.Now().UnixNano()
+	alias := fmt.Sprintf("rec-%d", ts)
+	if len(alias) > 50 {
+		alias = alias[:50]
+	}
+
 	u := &models.User{
 		Email:        uniqueEmail("rec"),
 		PasswordHash: hash,
 		FullName:     "Recovery Test",
+		Alias:        alias,
 		TBAccountID:  tbIDBytes,
 	}
 	if err := env.pg.CreateUserPending(ctx, u); err != nil {

@@ -134,6 +134,7 @@ func main() {
 		r.Post("/withdraw", txnHandler.WithdrawHandler)
 		r.Post("/transfer", txnHandler.TransferHandler)
 		r.Get("/history", txnHandler.HistoryHandler)
+		r.Post("/demo-topup", txnHandler.DemoTopupHandler)
 	})
 
 	// Rutas de cuenta (requieren JWT)
@@ -148,6 +149,7 @@ func main() {
 		r.Use(auth.RequireAuth(jwtSecret))
 		r.Post("/api/chat", chatHandler.ChatHandler)
 		r.Post("/api/chat/confirm", chatHandler.ConfirmHandler)
+		r.Get("/api/users/lookup", authHandler.LookupHandler)
 	})
 
 	srv := &http.Server{
