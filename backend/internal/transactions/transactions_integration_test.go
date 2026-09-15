@@ -127,7 +127,7 @@ func TestDeposit_Integration(t *testing.T) {
 
 	user := createActiveUser(t, env, "dep")
 
-	tx, err := env.svc.Deposit(ctx, user.ID, 10000)
+	tx, err := env.svc.Deposit(ctx, user.ID, 10000, "")
 	if err != nil {
 		t.Fatalf("Deposit: %v", err)
 	}
@@ -156,11 +156,11 @@ func TestWithdraw_Integration(t *testing.T) {
 
 	user := createActiveUser(t, env, "wd")
 
-	if _, err := env.svc.Deposit(ctx, user.ID, 10000); err != nil {
+	if _, err := env.svc.Deposit(ctx, user.ID, 10000, ""); err != nil {
 		t.Fatalf("Deposit: %v", err)
 	}
 
-	tx, err := env.svc.Withdraw(ctx, user.ID, 3000)
+	tx, err := env.svc.Withdraw(ctx, user.ID, 3000, "")
 	if err != nil {
 		t.Fatalf("Withdraw: %v", err)
 	}
@@ -183,11 +183,11 @@ func TestWithdraw_InsufficientFunds_Integration(t *testing.T) {
 
 	user := createActiveUser(t, env, "wdif")
 
-	if _, err := env.svc.Deposit(ctx, user.ID, 1000); err != nil {
+	if _, err := env.svc.Deposit(ctx, user.ID, 1000, ""); err != nil {
 		t.Fatalf("Deposit: %v", err)
 	}
 
-	_, err := env.svc.Withdraw(ctx, user.ID, 5000)
+	_, err := env.svc.Withdraw(ctx, user.ID, 5000, "")
 	if err == nil {
 		t.Fatal("esperaba error por fondos insuficientes")
 	}
@@ -203,12 +203,12 @@ func TestTransfer_Integration(t *testing.T) {
 	alice := createActiveUser(t, env, "alice")
 	bob := createActiveUser(t, env, "bob")
 
-	if _, err := env.svc.Deposit(ctx, alice.ID, 10000); err != nil {
+	if _, err := env.svc.Deposit(ctx, alice.ID, 10000, ""); err != nil {
 		t.Fatalf("Deposit Alice: %v", err)
 	}
 
 	bobTBHex := hex.EncodeToString(bob.TBAccountID)
-	tx, err := env.svc.Transfer(ctx, alice.ID, bobTBHex, 3000)
+	tx, err := env.svc.Transfer(ctx, alice.ID, bobTBHex, 3000, "")
 	if err != nil {
 		t.Fatalf("Transfer: %v", err)
 	}
@@ -233,12 +233,12 @@ func TestTransfer_SameAccount_Integration(t *testing.T) {
 
 	alice := createActiveUser(t, env, "alice-self")
 
-	if _, err := env.svc.Deposit(ctx, alice.ID, 10000); err != nil {
+	if _, err := env.svc.Deposit(ctx, alice.ID, 10000, ""); err != nil {
 		t.Fatalf("Deposit: %v", err)
 	}
 
 	aliceTBHex := hex.EncodeToString(alice.TBAccountID)
-	_, err := env.svc.Transfer(ctx, alice.ID, aliceTBHex, 1000)
+	_, err := env.svc.Transfer(ctx, alice.ID, aliceTBHex, 1000, "")
 	if err == nil {
 		t.Fatal("esperaba error por misma cuenta")
 	}
@@ -253,7 +253,7 @@ func TestTransfer_DestNotFound_Integration(t *testing.T) {
 
 	alice := createActiveUser(t, env, "alice-destnf")
 
-	if _, err := env.svc.Deposit(ctx, alice.ID, 10000); err != nil {
+	if _, err := env.svc.Deposit(ctx, alice.ID, 10000, ""); err != nil {
 		t.Fatalf("Deposit: %v", err)
 	}
 
@@ -263,7 +263,7 @@ func TestTransfer_DestNotFound_Integration(t *testing.T) {
 	}
 	randomHex := hex.EncodeToString(random[:])
 
-	_, err := env.svc.Transfer(ctx, alice.ID, randomHex, 1000)
+	_, err := env.svc.Transfer(ctx, alice.ID, randomHex, 1000, "")
 	if err == nil {
 		t.Fatal("esperaba error por cuenta destino inexistente")
 	}
@@ -278,13 +278,13 @@ func TestHistory_Integration(t *testing.T) {
 
 	user := createActiveUser(t, env, "hist")
 
-	if _, err := env.svc.Deposit(ctx, user.ID, 10000); err != nil {
+	if _, err := env.svc.Deposit(ctx, user.ID, 10000, ""); err != nil {
 		t.Fatalf("Deposit 1: %v", err)
 	}
-	if _, err := env.svc.Deposit(ctx, user.ID, 5000); err != nil {
+	if _, err := env.svc.Deposit(ctx, user.ID, 5000, ""); err != nil {
 		t.Fatalf("Deposit 2: %v", err)
 	}
-	if _, err := env.svc.Withdraw(ctx, user.ID, 3000); err != nil {
+	if _, err := env.svc.Withdraw(ctx, user.ID, 3000, ""); err != nil {
 		t.Fatalf("Withdraw: %v", err)
 	}
 

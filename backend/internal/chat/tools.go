@@ -234,7 +234,7 @@ func (e *Executor) execDeposit(ctx context.Context, userID string, args map[stri
 		return nil, err
 	}
 
-	tx, err := e.txnSvc.Deposit(ctx, userID, amount)
+	tx, err := e.txnSvc.Deposit(ctx, userID, amount, "")
 	if err != nil {
 		return nil, err
 	}
@@ -253,7 +253,7 @@ func (e *Executor) execWithdraw(ctx context.Context, userID string, args map[str
 		return nil, err
 	}
 
-	tx, err := e.txnSvc.Withdraw(ctx, userID, amount)
+	tx, err := e.txnSvc.Withdraw(ctx, userID, amount, "")
 	if err != nil {
 		return nil, err
 	}
@@ -277,7 +277,7 @@ func (e *Executor) execTransfer(ctx context.Context, userID string, args map[str
 		return nil, err
 	}
 
-	tx, err := e.txnSvc.Transfer(ctx, userID, toAccountID, amount)
+	tx, err := e.txnSvc.Transfer(ctx, userID, toAccountID, amount, "")
 	if err != nil {
 		return nil, err
 	}

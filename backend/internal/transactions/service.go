@@ -1,14 +1,8 @@
-// Package transactions implementa la lógica de negocio de las
-// operaciones financieras: depósito, retiro, transferencia y historial.
-//
-// Todas las operaciones se ejecutan contra TigerBeetle, que es la
-// fuente de verdad financiera. Después de cada operación exitosa se
-// escribe un índice en PostgreSQL (transactions_log) para responder
-// el historial rápido.
 package transactions
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"log"
@@ -21,8 +15,7 @@ import (
 	"banking-system/internal/models"
 )
 
-// TBClient abstrae las operaciones de TigerBeetle que necesita el Service.
-// Permite mockear en tests unitarios.
+// TBClient abstrae las operaciones de TigerBeetle.
 type TBClient interface {
 	AccountExists(id tb.Uint128) (bool, error)
 	CreateTransfer(t *models.Transaction) ([]byte, error)
@@ -52,7 +45,7 @@ type TransferRequest struct {
 // UserTransferRequest es el DTO de entrada de
 // POST /api/transactions/transfer.
 type UserTransferRequest struct {
-	ToAccountID string `json:"to_account_id"` // hex del uint128 destino
+	ToAccountID string `json:"to_account_id"`
 	AmountCents int64  `json:"amount_cents"`
 }
 
@@ -69,12 +62,14 @@ type HistoryResult struct {
 
 // Deposit agrega fondos a la cuenta del usuario.
 //
-// Flujo:
-//  1. Validar amountCents > 0.
-//  2. Buscar usuario.
-//  3. Crear transferencia banco -> usuario.
-//  4. Registrar en transactions_log.
-func (s *Service) Deposit(ctx context.Context, userID string, amountCents int64) (*models.Transaction, error) {
+// idempotencyKey es opcional. Si se provee, el TBTransferID se deriva
+// determinísticamente del key. Reintentos con el mismo key son seguros.
+func (s *Service) Deposit(
+	ctx context.Context,
+	userID string,
+	amountCents int64,
+	idempotencyKey string,
+) (*models.Transaction, error) {
 	if err := validateAmount(amountCents); err != nil {
 		return nil, err
 	}
@@ -92,6 +87,7 @@ func (s *Service) Deposit(ctx context.Context, userID string, amountCents int64)
 		CreditAccountID: u128ToBytes(userTBID),
 		AmountCents:     amountCents,
 		Code:            models.TransferCodeDeposit,
+		IdempotencyKey:  deriveIdempotencyKey(userID, idempotencyKey),
 	}
 
 	if err := s.executeTransfer(ctx, tx); err != nil {
@@ -101,14 +97,12 @@ func (s *Service) Deposit(ctx context.Context, userID string, amountCents int64)
 }
 
 // Withdraw retira fondos de la cuenta del usuario.
-//
-// Flujo:
-//  1. Validar amountCents > 0.
-//  2. Buscar usuario.
-//  3. Crear transferencia usuario -> banco.
-//  4. TigerBeetle valida saldo suficiente.
-//  5. Registrar en transactions_log.
-func (s *Service) Withdraw(ctx context.Context, userID string, amountCents int64) (*models.Transaction, error) {
+func (s *Service) Withdraw(
+	ctx context.Context,
+	userID string,
+	amountCents int64,
+	idempotencyKey string,
+) (*models.Transaction, error) {
 	if err := validateAmount(amountCents); err != nil {
 		return nil, err
 	}
@@ -126,6 +120,7 @@ func (s *Service) Withdraw(ctx context.Context, userID string, amountCents int64
 		CreditAccountID: u128ToBytes(bankID),
 		AmountCents:     amountCents,
 		Code:            models.TransferCodeWithdrawal,
+		IdempotencyKey:  deriveIdempotencyKey(userID, idempotencyKey),
 	}
 
 	if err := s.executeTransfer(ctx, tx); err != nil {
@@ -135,20 +130,12 @@ func (s *Service) Withdraw(ctx context.Context, userID string, amountCents int64
 }
 
 // Transfer envía fondos a otra cuenta.
-//
-// Flujo:
-//  1. Validar amountCents > 0.
-//  2. Decodificar toAccountHex.
-//  3. Buscar usuario origen.
-//  4. Buscar usuario destino (debe estar ACTIVE).
-//  5. Validar que origen != destino.
-//  6. Crear transferencia origen -> destino.
-//  7. Registrar en transactions_log.
 func (s *Service) Transfer(
 	ctx context.Context,
 	userID string,
 	toAccountHex string,
 	amountCents int64,
+	idempotencyKey string,
 ) (*models.Transaction, error) {
 	if err := validateAmount(amountCents); err != nil {
 		return nil, err
@@ -164,11 +151,8 @@ func (s *Service) Transfer(
 		return nil, err
 	}
 
-	// Validar que el destino exista y esté ACTIVE.
 	dst, err := s.pg.GetUserByTBAccountID(ctx, toBytes)
 	if err != nil {
-		// Si no existe, apperr.NotFound. Lo traducimos a algo más
-		// específico del contexto de transferencia.
 		if appErr, ok := err.(*apperr.AppError); ok && appErr.Code == "USER_NOT_FOUND" {
 			return nil, apperr.NotFound("DEST_NOT_FOUND", "Cuenta destino no encontrada")
 		}
@@ -178,7 +162,6 @@ func (s *Service) Transfer(
 		return nil, apperr.BadRequest("DEST_NOT_ACTIVE", "La cuenta destino no está activa")
 	}
 
-	// Validar que no sea la misma cuenta.
 	if bytesEqual(src.TBAccountID, dst.TBAccountID) {
 		return nil, apperr.BadRequest("SAME_ACCOUNT", "Origen y destino no pueden ser la misma cuenta")
 	}
@@ -188,6 +171,7 @@ func (s *Service) Transfer(
 		CreditAccountID: dst.TBAccountID,
 		AmountCents:     amountCents,
 		Code:            models.TransferCodeUserTransfer,
+		IdempotencyKey:  deriveIdempotencyKey(userID, idempotencyKey),
 	}
 
 	if err := s.executeTransfer(ctx, tx); err != nil {
@@ -197,11 +181,6 @@ func (s *Service) Transfer(
 }
 
 // History devuelve el historial paginado del usuario.
-//
-// Flujo:
-//  1. Buscar usuario.
-//  2. ListTransactions con limit/offset.
-//  3. Calcular total_pages.
 func (s *Service) History(ctx context.Context, userID string, page, limit int) (*HistoryResult, error) {
 	if page < 1 {
 		page = 1
@@ -234,6 +213,21 @@ func (s *Service) History(ctx context.Context, userID string, page, limit int) (
 
 // --- Helpers ---
 
+// deriveIdempotencyKey combina el userID con la key del cliente.
+//
+// Incluir el userID evita que dos usuarios distintos con la misma
+// idempotencyKey generen el mismo TBTransferID.
+func deriveIdempotencyKey(userID, clientKey string) string {
+	if clientKey == "" {
+		return ""
+	}
+	h := sha256.New()
+	h.Write([]byte(userID))
+	h.Write([]byte{0x00})
+	h.Write([]byte(clientKey))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
 // getActiveUser busca un usuario y valida que esté ACTIVE.
 func (s *Service) getActiveUser(ctx context.Context, userID string) (*models.User, error) {
 	user, err := s.pg.GetUserByID(ctx, userID)
@@ -247,17 +241,6 @@ func (s *Service) getActiveUser(ctx context.Context, userID string) (*models.Use
 }
 
 // executeTransfer ejecuta la transferencia en TB y registra el log.
-//
-// Si TB rechaza la transferencia, devuelve el error (la operación NO
-// se realizó).
-//
-// Si TB acepta pero InsertTransactionLog falla, se loggea el error y
-// se devuelve éxito. La fuente de verdad es TigerBeetle: la
-// transferencia SÍ se hizo. El log es un índice de lectura secundario.
-//
-// Después del insert, se llama FillHex para que la respuesta JSON
-// incluya los campos derivados (debit_account_id, credit_account_id
-// en formato hex).
 func (s *Service) executeTransfer(ctx context.Context, tx *models.Transaction) error {
 	transferID, err := s.tb.CreateTransfer(tx)
 	if err != nil {
@@ -268,13 +251,13 @@ func (s *Service) executeTransfer(ctx context.Context, tx *models.Transaction) e
 	if err := s.pg.InsertTransactionLog(ctx, tx); err != nil {
 		log.Printf("[tx] transferencia %s ejecutada en TB pero log falló: %v",
 			hex.EncodeToString(transferID), err)
-		// No devolvemos error: el dinero ya se movió.
 	}
 
-	// Llenar los campos hex para que la respuesta JSON sea completa.
 	tx.FillHex()
 	return nil
-} // validateAmount valida que el monto sea positivo.
+}
+
+// validateAmount valida que el monto sea positivo.
 func validateAmount(amountCents int64) error {
 	if amountCents <= 0 {
 		return apperr.BadRequest("INVALID_AMOUNT", "El monto debe ser mayor a cero")

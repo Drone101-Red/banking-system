@@ -1,6 +1,8 @@
 package tigerbeetle
 
 import (
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"strconv"
@@ -226,10 +228,10 @@ func (c *Client) CreateTransfer(t *models.Transaction) ([]byte, error) {
 		return nil, apperr.BadRequest("INVALID_AMOUNT", "El monto debe ser positivo")
 	}
 
-	transferID, transferIDBytes, err := generateTransferID(t.TBTransferID)
-	if err != nil {
-		return nil, apperr.Internal(fmt.Errorf("generar transfer ID: %w", err))
-	}
+	transferID, transferIDBytes, err := generateTransferID(
+		t.TBTransferID,
+		t.IdempotencyKey,
+	)
 
 	res, err := c.client.CreateTransfers([]tb.Transfer{{
 		ID:              transferID,
@@ -383,19 +385,31 @@ func uint128ToInt64(u tb.Uint128) int64 {
 	b := u.Bytes()
 	return int64(binary.LittleEndian.Uint64(b[:8]))
 }
-
-// generateTransferID genera un ID de transferencia si no se provee uno.
-//
-// Nota: usa el timestamp en nanosegundos para que reintentos con el mismo
-// payload sean idempotentes (mismo ID -> TransferExists -> OK).
-func generateTransferID(provided []byte) (tb.Uint128, []byte, error) {
+func generateTransferID(
+	provided []byte,
+	idempotencyKey string,
+) (tb.Uint128, []byte, error) {
 	if len(provided) == 16 {
 		return bytesToU128(provided), provided, nil
 	}
-	b := make([]byte, 16)
+
+	if idempotencyKey != "" {
+		h := sha256.New()
+		h.Write([]byte(idempotencyKey))
+		sum := h.Sum(nil)
+		var b [16]byte
+		copy(b[:], sum[:16])
+		return tb.BytesToUint128(b), b[:], nil
+	}
+
+	// Fallback: timestamp + random
+	var b [16]byte
 	now := time.Now().UnixNano()
 	for i := 0; i < 8; i++ {
 		b[i] = byte(now >> (56 - i*8))
 	}
-	return bytesToU128(b), b, nil
+	if _, err := rand.Read(b[8:]); err != nil {
+		return tb.Uint128{}, nil, fmt.Errorf("rand.Read: %w", err)
+	}
+	return tb.BytesToUint128(b), b[:], nil
 }

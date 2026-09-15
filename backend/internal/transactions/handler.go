@@ -10,6 +10,8 @@ import (
 	"banking-system/internal/auth"
 )
 
+const idempotencyKeyHeader = "Idempotency-Key"
+
 // Handler expone los endpoints HTTP de transacciones.
 type Handler struct {
 	service *Service
@@ -36,7 +38,9 @@ func (h *Handler) DepositHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tx, err := h.service.Deposit(r.Context(), userID, req.AmountCents)
+	idemKey := r.Header.Get(idempotencyKeyHeader)
+
+	tx, err := h.service.Deposit(r.Context(), userID, req.AmountCents, idemKey)
 	if err != nil {
 		apperr.Write(w, err)
 		return
@@ -61,7 +65,9 @@ func (h *Handler) WithdrawHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tx, err := h.service.Withdraw(r.Context(), userID, req.AmountCents)
+	idemKey := r.Header.Get(idempotencyKeyHeader)
+
+	tx, err := h.service.Withdraw(r.Context(), userID, req.AmountCents, idemKey)
 	if err != nil {
 		apperr.Write(w, err)
 		return
@@ -86,7 +92,9 @@ func (h *Handler) TransferHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tx, err := h.service.Transfer(r.Context(), userID, req.ToAccountID, req.AmountCents)
+	idemKey := r.Header.Get(idempotencyKeyHeader)
+
+	tx, err := h.service.Transfer(r.Context(), userID, req.ToAccountID, req.AmountCents, idemKey)
 	if err != nil {
 		apperr.Write(w, err)
 		return
@@ -96,10 +104,6 @@ func (h *Handler) TransferHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // HistoryHandler maneja GET /api/transactions/history.
-//
-// Query params:
-//   - page:  número de página (default 1)
-//   - limit: elementos por página (default 20, max 100)
 func (h *Handler) HistoryHandler(w http.ResponseWriter, r *http.Request) {
 	userID, ok := auth.UserIDFromContext(r.Context())
 	if !ok {
@@ -121,7 +125,6 @@ func (h *Handler) HistoryHandler(w http.ResponseWriter, r *http.Request) {
 
 // --- Helpers ---
 
-// writeJSON serializa v a JSON con el status HTTP dado.
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -130,8 +133,6 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	}
 }
 
-// parseIntQuery lee un query param como int, con default si está vacío
-// o es inválido.
 func parseIntQuery(r *http.Request, key string, def int) int {
 	v := r.URL.Query().Get(key)
 	if v == "" {

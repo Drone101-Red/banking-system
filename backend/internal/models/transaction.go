@@ -6,9 +6,6 @@ import (
 )
 
 // Códigos de transferencia (Transfer.code en TigerBeetle).
-//
-// Cada transferencia en TigerBeetle lleva un code que indica su tipo.
-// Se usan para auditoría y para que el historial sea interpretable.
 const (
 	// TransferCodeDeposit es una transferencia banco -> usuario.
 	TransferCodeDeposit uint16 = 1
@@ -36,10 +33,14 @@ type Transaction struct {
 	AmountCents     int64     `json:"amount_cents"`
 	Code            uint16    `json:"code"`
 	CreatedAt       time.Time `json:"created_at"`
+
+	// IdempotencyKey es la clave enviada por el cliente para garantizar
+	// idempotencia. NO se persiste en PostgreSQL. Se usa solo para
+	// generar el TBTransferID de forma determinística.
+	IdempotencyKey string `json:"-"`
 }
 
 // FillHex llena los campos DebitHex y CreditHex a partir de los bytes.
-// Llamar antes de serializar a JSON.
 func (t *Transaction) FillHex() {
 	t.DebitHex = hex.EncodeToString(t.DebitAccountID)
 	t.CreditHex = hex.EncodeToString(t.CreditAccountID)
@@ -55,9 +56,6 @@ const (
 
 // DirectionFor devuelve el sentido de la transacción para el usuario
 // cuyo TBAccountID es `userTBID`.
-//
-//   - Si el usuario es el credit_account_id -> "in" (recibió).
-//   - Si el usuario es el debit_account_id  -> "out" (envió).
 func (t *Transaction) DirectionFor(userTBID []byte) Direction {
 	if bytesEqual(t.CreditAccountID, userTBID) {
 		return DirectionIn
