@@ -57,7 +57,7 @@ func (s *PostgresConfirmationStore) Save(ctx context.Context, op *PendingOperati
 		ctx,
 		op.UserID,
 		operationJSON,
-		time.Now().Add(ConfirmationTTL),
+		time.Now().UTC().Add(ConfirmationTTL),
 	)
 	if err != nil {
 		return err
