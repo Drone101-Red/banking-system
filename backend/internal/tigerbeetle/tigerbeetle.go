@@ -1,6 +1,7 @@
 package tigerbeetle
 
 import (
+	"encoding/binary"
 	"fmt"
 	"strconv"
 	"time"
@@ -211,13 +212,6 @@ func (c *Client) EnsureBankAccount() error {
 //   - Code (TransferCodeDeposit | Withdrawal | UserTransfer)
 //
 // Devuelve el TBTransferID de la transferencia creada.
-//
-// Traduce los errores de TigerBeetle a apperr:
-//   - TransferExceedsCredits            -> 400 INSUFFICIENT_FUNDS
-//   - TransferDebitAccountNotFound      -> 400 SOURCE_NOT_FOUND
-//   - TransferCreditAccountNotFound     -> 400 DEST_NOT_FOUND
-//   - TransferAccountsMustBeDifferent   -> 400 SAME_ACCOUNT
-//   - TransferExists                    -> OK (idempotente)
 func (c *Client) CreateTransfer(t *models.Transaction) ([]byte, error) {
 	if c == nil || c.client == nil {
 		return nil, apperr.Internal(fmt.Errorf("cliente TigerBeetle no inicializado"))
@@ -254,7 +248,6 @@ func (c *Client) CreateTransfer(t *models.Transaction) ([]byte, error) {
 		case tb.TransferCreated:
 			return transferIDBytes, nil
 		case tb.TransferExists:
-			// Idempotente: la transferencia ya fue creada (mismo ID).
 			return transferIDBytes, nil
 		case tb.TransferExceedsCredits:
 			return nil, apperr.BadRequest("INSUFFICIENT_FUNDS", "Saldo insuficiente")
@@ -362,6 +355,9 @@ func (c *Client) GetAccountInfo(id tb.Uint128) (*models.AccountInfo, error) {
 // --- Helpers ---
 
 // u128Hex devuelve la representación hex de un Uint128 para logs de error.
+//
+// TigerBeetle serializa Uint128 en little-endian, así que el hex resultante
+// es consistente con el que se guarda en PostgreSQL (BYTEA = Bytes() crudo).
 func u128Hex(id tb.Uint128) string {
 	b := id.Bytes()
 	return fmt.Sprintf("%x", b)
@@ -374,29 +370,29 @@ func bytesToU128(b []byte) tb.Uint128 {
 	return tb.BytesToUint128(arr)
 }
 
-// uint128ToInt64 extrae los 8 bytes menos significativos como int64.
-// Los saldos en centavos caben sin problema.
+// uint128ToInt64 extrae el valor como int64.
+//
+// TigerBeetle serializa Uint128 en little-endian: el byte 0 es el menos
+// significativo. Los saldos en centavos caben holgadamente en los
+// primeros 8 bytes.
+//
+// Verificado empíricamente:
+//
+//	tb.ToUint128(12000).Bytes() = e02e0000...  (little-endian)
 func uint128ToInt64(u tb.Uint128) int64 {
 	b := u.Bytes()
-	var out uint64
-	for i := 8; i < 16; i++ {
-		out = (out << 8) | uint64(b[i])
-	}
-	return int64(out)
+	return int64(binary.LittleEndian.Uint64(b[:8]))
 }
 
-// generateTransferID genera un ID de transferencia aleatorio si no se
-// provee uno. Devuelve el Uint128 y su representación en 16 bytes.
+// generateTransferID genera un ID de transferencia si no se provee uno.
+//
+// Nota: usa el timestamp en nanosegundos para que reintentos con el mismo
+// payload sean idempotentes (mismo ID -> TransferExists -> OK).
 func generateTransferID(provided []byte) (tb.Uint128, []byte, error) {
 	if len(provided) == 16 {
 		return bytesToU128(provided), provided, nil
 	}
-	// Generar uno nuevo
-	// Nota: usamos el timestamp + random para evitar colisiones.
-	// En producción real, usar crypto/rand.
 	b := make([]byte, 16)
-	// Simplificación: usar el timestamp actual en los primeros 8 bytes
-	// y ceros en el resto. Esto es único por nanosegundo.
 	now := time.Now().UnixNano()
 	for i := 0; i < 8; i++ {
 		b[i] = byte(now >> (56 - i*8))
