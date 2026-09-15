@@ -105,14 +105,12 @@ func TestGenerateTBAccountID_Valid(t *testing.T) {
 	if len(bytes) != 16 {
 		t.Fatalf("esperaba 16 bytes, obtuve %d", len(bytes))
 	}
-	// Verificar que bytes e id representan lo mismo
 	if tb.BytesToUint128([16]byte(bytes)) != id {
 		t.Fatal("bytes e id no coinciden")
 	}
 }
 
 func TestGenerateTBAccountID_Randomness(t *testing.T) {
-	// Generar 100 y confirmar que son distintos (altísima probabilidad).
 	seen := make(map[string]bool)
 	for i := 0; i < 100; i++ {
 		id, _, err := generateTBAccountID()
@@ -125,5 +123,56 @@ func TestGenerateTBAccountID_Randomness(t *testing.T) {
 			t.Fatalf("colisión en iteración %d", i)
 		}
 		seen[key] = true
+	}
+}
+
+// --- validateLogin ---
+
+func TestValidateLogin_Valid(t *testing.T) {
+	req := LoginRequest{
+		Email:    "juan@example.com",
+		Password: "TestPassword123!",
+	}
+	if err := validateLogin(req, "juan@example.com"); err != nil {
+		t.Fatalf("validateLogin: %v", err)
+	}
+}
+
+func TestValidateLogin_EmptyEmail(t *testing.T) {
+	req := LoginRequest{
+		Password: "TestPassword123!",
+	}
+	err := validateLogin(req, "")
+	if err == nil {
+		t.Fatal("esperaba error por email vacío")
+	}
+	if !strings.Contains(err.Error(), "EMAIL_REQUIRED") {
+		t.Fatalf("código esperado EMAIL_REQUIRED, obtuve: %v", err)
+	}
+}
+
+func TestValidateLogin_EmptyPassword(t *testing.T) {
+	req := LoginRequest{
+		Email: "juan@example.com",
+	}
+	err := validateLogin(req, "juan@example.com")
+	if err == nil {
+		t.Fatal("esperaba error por password vacía")
+	}
+	if !strings.Contains(err.Error(), "PASSWORD_REQUIRED") {
+		t.Fatalf("código esperado PASSWORD_REQUIRED, obtuve: %v", err)
+	}
+}
+
+func TestValidateLogin_NoEmailFormatValidation(t *testing.T) {
+	// validateLogin NO valida formato del email (eso se resuelve con el
+	// lookup). Acepta emails mal formados; el login fallará con
+	// INVALID_CREDENTIALS.
+	req := LoginRequest{
+		Email:    "noesunemail",
+		Password: "TestPassword123!",
+	}
+	if err := validateLogin(req, "noesunemail"); err != nil {
+		t.Fatalf("validateLogin no debería validar formato: %v", err)
 	}
 }

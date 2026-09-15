@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -30,6 +31,16 @@ func main() {
 	port := getEnv("APP_PORT", "8080")
 	tbAddress := getEnv("TB_ADDRESS", "tigerbeetle:3000")
 	tbClusterID := getEnv("TB_CLUSTER_ID", "0")
+
+	jwtSecret := getEnv("JWT_SECRET", "")
+	jwtExpiryHours := getEnvInt("JWT_EXPIRY_HOURS", 24)
+
+	if jwtSecret == "" {
+		log.Fatal("❌ JWT_SECRET no configurado. Definir en .env")
+	}
+	if len(jwtSecret) < 32 {
+		log.Fatal("❌ JWT_SECRET debe tener al menos 32 caracteres")
+	}
 
 	dsn := fmt.Sprintf(
 		"host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
@@ -54,14 +65,14 @@ func main() {
 	}
 	log.Println("✅ TigerBeetle conectado")
 
-	// Bootstrap de la infraestructura financiera.
 	if err := tbClient.EnsureBankAccount(); err != nil {
 		log.Fatalf("❌ Cuenta banco: %v", err)
 	}
 	log.Println("✅ Cuenta banco verificada (ID=1)")
 
 	// Wiring de servicios
-	authService := auth.NewService(pg, tbClient)
+	jwtExpiry := time.Duration(jwtExpiryHours) * time.Hour
+	authService := auth.NewService(pg, tbClient, jwtSecret, jwtExpiry)
 	authHandler := auth.NewHandler(authService)
 
 	r := chi.NewRouter()
@@ -145,4 +156,17 @@ func getEnv(k, def string) string {
 		return v
 	}
 	return def
+}
+
+func getEnvInt(k string, def int) int {
+	v := os.Getenv(k)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		log.Printf("⚠️  %s no es un entero válido (%q), usando default %d", k, v, def)
+		return def
+	}
+	return n
 }

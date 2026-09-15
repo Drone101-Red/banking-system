@@ -41,7 +41,8 @@ func newTestEnv(t *testing.T) (*auth.Service, *db.PostgresStore) {
 	}
 	t.Cleanup(func() { tbClient.Close() })
 
-	service := auth.NewService(pg, tbClient)
+	// Secret y expiry dummy: los tests de register no usan JWT.
+	service := auth.NewService(pg, tbClient, "7t3ZZZ0nIVIS3Cb5zQP3S8x+ui0JjYUZ1nhCcimh3AM=", time.Hour)
 	return service, pg
 }
 

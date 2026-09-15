@@ -4,8 +4,10 @@ package auth
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	tb "github.com/tigerbeetle/tigerbeetle-go"
 
@@ -15,73 +17,74 @@ import (
 	"banking-system/internal/password"
 )
 
-// RegisterRequest es el DTO de entrada de POST /api/auth/register.
+// dummyPasswordHash es un hash bcrypt cost 12 de una contraseña que nadie
+// conoce. Se usa para mitigar timing attacks en Login cuando el email no
+// existe: comparamos contra este hash para mantener el tiempo de respuesta
+// constante, y luego ignoramos el resultado.
 //
-// Las validaciones se aplican en el service (no en el handler) para
-// mantener el handler delgado. Ver docs/step3/3.1-3.4-auth-design.md, 3.2.
+// Ver docs/step3/3.6-login.md, decisión "timing attack mitigation".
+const dummyPasswordHash = "$2a$12$pHpHZ1qj/K0ErwbTaxyDrO2e8KYQRhlJWOWY7EXoKYUq443Wnqfsm"
+
+// RegisterRequest es el DTO de entrada de POST /api/auth/register.
 type RegisterRequest struct {
 	Email    string `json:"email"`
 	Password string `json:"password"`
 	FullName string `json:"full_name"`
 }
 
+// LoginRequest es el DTO de entrada de POST /api/auth/login.
+type LoginRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
 // TBAccountCreator abstrae las operaciones que el service necesita de TB.
-// Permite mockear en tests unitarios.
 type TBAccountCreator interface {
 	CreateAccount(id tb.Uint128, code uint16) error
 }
 
 // Service orquesta las operaciones de autenticación.
 type Service struct {
-	pg       *db.PostgresStore
-	tbClient TBAccountCreator
+	pg        *db.PostgresStore
+	tbClient  TBAccountCreator
+	jwtSecret string
+	jwtExpiry time.Duration
 }
 
 // NewService construye el Service.
-func NewService(pg *db.PostgresStore, tbClient TBAccountCreator) *Service {
+//
+// Requiere el JWT secret y el expiry porque Login los necesita para
+// firmar tokens. No hay estado parcialmente inicializado.
+func NewService(pg *db.PostgresStore, tbClient TBAccountCreator, jwtSecret string, jwtExpiry time.Duration) *Service {
 	return &Service{
-		pg:       pg,
-		tbClient: tbClient,
+		pg:        pg,
+		tbClient:  tbClient,
+		jwtSecret: jwtSecret,
+		jwtExpiry: jwtExpiry,
 	}
 }
 
-// Register crea un usuario nuevo siguiendo el flujo PENDING -> ACTIVE:
+// Register crea un usuario nuevo siguiendo el flujo PENDING -> ACTIVE.
 //
-//  1. Valida y normaliza el request.
-//  2. Genera tb_account_id aleatorio.
-//  3. Hashea la contraseña con bcrypt.
-//  4. INSERT en PostgreSQL con status=PENDING.
-//  5. Crea cuenta en TigerBeetle.
-//  6. UPDATE en PostgreSQL a status=ACTIVE.
-//  7. Devuelve el usuario creado.
-//
-// Si el paso 5 falla, el usuario queda en PENDING y el reconciliador
-// lo recuperará después. No es un error fatal para el cliente más allá
-// de devolver 503.
+// Ver docs/step3/3.5-register.md para el detalle.
 func (s *Service) Register(ctx context.Context, req RegisterRequest) (*models.User, error) {
-	// 1. Normalizar
 	email := strings.ToLower(strings.TrimSpace(req.Email))
 	fullName := strings.TrimSpace(req.FullName)
-	// No normalizamos password (ver docs 3.2).
 
-	// 2. Validar
 	if err := validateRegister(req, email, fullName); err != nil {
 		return nil, err
 	}
 
-	// 3. Generar tb_account_id (crypto/rand 16 bytes)
 	tbID, tbIDBytes, err := generateTBAccountID()
 	if err != nil {
 		return nil, apperr.Internal(fmt.Errorf("generar tb_account_id: %w", err))
 	}
 
-	// 4. Hash password
 	hash, err := password.Hash(req.Password)
 	if err != nil {
 		return nil, apperr.BadRequest("WEAK_PASSWORD", err.Error())
 	}
 
-	// 5. INSERT PENDING
 	user := &models.User{
 		Email:        email,
 		PasswordHash: hash,
@@ -92,18 +95,11 @@ func (s *Service) Register(ctx context.Context, req RegisterRequest) (*models.Us
 		return nil, err
 	}
 
-	// 6. Crear cuenta en TB
 	if err := s.tbClient.CreateAccount(tbID, models.CodeSavings); err != nil {
-		// Usuario queda PENDING. El reconciliador lo recuperará.
-		// No borramos el usuario: el diseño dice explícitamente que
-		// un PENDING recuperable es preferible a perder el registro.
 		return nil, apperr.Internal(fmt.Errorf("crear cuenta TB: %w", err))
 	}
 
-	// 7. UPDATE a ACTIVE
 	if err := s.pg.UpdateUserStatusActive(ctx, user.ID); err != nil {
-		// Mismo razonamiento: el usuario quedará PENDING y el
-		// reconciliador lo pasará a ACTIVE en el próximo ciclo.
 		return nil, apperr.Internal(fmt.Errorf("activar usuario: %w", err))
 	}
 
@@ -111,7 +107,65 @@ func (s *Service) Register(ctx context.Context, req RegisterRequest) (*models.Us
 	return user, nil
 }
 
-// validateRegister aplica las validaciones del request.
+// Login autentica un usuario y devuelve un JWT.
+//
+// Contrato:
+//
+//	email vacío                              → 400 EMAIL_REQUIRED
+//	password vacía                           → 400 PASSWORD_REQUIRED
+//	email inexistente                        → 401 INVALID_CREDENTIALS
+//	password incorrecta                      → 401 INVALID_CREDENTIALS
+//	password correcta + status PENDING       → 401 ACCOUNT_PENDING
+//	password correcta + status ACTIVE        → 200 con user + JWT
+//
+// Los casos de credenciales inválidas son indistinguibles para el cliente:
+// ni el mensaje ni el timing revelan si el email existe.
+func (s *Service) Login(ctx context.Context, req LoginRequest) (*models.User, string, error) {
+	email := strings.ToLower(strings.TrimSpace(req.Email))
+
+	if err := validateLogin(req, email); err != nil {
+		return nil, "", err
+	}
+
+	// Buscar usuario. Si no existe, mantenemos el timing constante con
+	// un bcrypt dummy y devolvemos el mismo error que "password incorrecta".
+	user, err := s.pg.GetUserByEmail(ctx, email)
+	if err != nil {
+		var appErr *apperr.AppError
+		if errors.As(err, &appErr) && appErr.Code == "USER_NOT_FOUND" {
+			// Timing attack mitigation.
+			_ = password.Compare(dummyPasswordHash, req.Password)
+			return nil, "", apperr.Unauthorized("INVALID_CREDENTIALS", "Credenciales inválidas")
+		}
+		return nil, "", err
+	}
+
+	// Verificar password.
+	if err := password.Compare(user.PasswordHash, req.Password); err != nil {
+		if errors.Is(err, password.ErrMismatch) {
+			return nil, "", apperr.Unauthorized("INVALID_CREDENTIALS", "Credenciales inválidas")
+		}
+		return nil, "", apperr.Internal(fmt.Errorf("comparar password: %w", err))
+	}
+
+	// Verificar status DESPUÉS de validar password.
+	if user.Status == models.StatusPending {
+		return nil, "", apperr.Unauthorized("ACCOUNT_PENDING", "Tu cuenta está siendo procesada")
+	}
+	if user.Status != models.StatusActive {
+		return nil, "", apperr.Unauthorized("ACCOUNT_INVALID_STATUS", "Estado de cuenta inválido")
+	}
+
+	// Generar JWT.
+	token, err := GenerateToken(user, s.jwtSecret, s.jwtExpiry)
+	if err != nil {
+		return nil, "", apperr.Internal(fmt.Errorf("generar JWT: %w", err))
+	}
+
+	return user, token, nil
+}
+
+// validateRegister aplica las validaciones del request de registro.
 func validateRegister(req RegisterRequest, email, fullName string) error {
 	if email == "" {
 		return apperr.BadRequest("EMAIL_REQUIRED", "El email es obligatorio")
@@ -136,6 +190,21 @@ func validateRegister(req RegisterRequest, email, fullName string) error {
 	return nil
 }
 
+// validateLogin aplica las validaciones del request de login.
+//
+// Deliberadamente laxas: solo verifica que los campos no estén vacíos.
+// La validación "dura" (email válido, password correcta) es la del login
+// en sí, y se resuelve con un único error genérico.
+func validateLogin(req LoginRequest, email string) error {
+	if email == "" {
+		return apperr.BadRequest("EMAIL_REQUIRED", "El email es obligatorio")
+	}
+	if req.Password == "" {
+		return apperr.BadRequest("PASSWORD_REQUIRED", "La contraseña es obligatoria")
+	}
+	return nil
+}
+
 // generateTBAccountID genera un uint128 aleatorio (crypto/rand) y su
 // representación en 16 bytes (big-endian).
 //
@@ -148,7 +217,7 @@ func generateTBAccountID() (tb.Uint128, []byte, error) {
 		}
 		id := tb.BytesToUint128(b)
 		if id == tb.ToUint128(0) || id == tb.ToUint128(1) {
-			continue // regenerar
+			continue
 		}
 		return id, b[:], nil
 	}
