@@ -22,7 +22,7 @@ const (
 	// LookupAccounts. El cliente TigerBeetle no acepta context.Context y
 	// no tiene timeout configurable, así que el timeout se aplica desde
 	// afuera, con una goroutine y un select sobre time.After.
-	accountLookupTimeout = 2 * time.Second
+	accountLookupTimeout = 5 * time.Second
 )
 
 type Client struct {
