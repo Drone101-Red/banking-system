@@ -72,6 +72,18 @@ services:
     networks:
       - banking_net
 
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: banking-frontend
+    depends_on:
+      - backend
+    ports:
+      - "80:80"
+    networks:
+      - banking_net
+
 volumes:
   postgres_data:
   tb_data:
