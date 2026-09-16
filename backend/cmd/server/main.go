@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -17,6 +18,7 @@ import (
 	tb "github.com/tigerbeetle/tigerbeetle-go"
 
 	"banking-system/internal/account"
+	"banking-system/internal/apperr"
 	"banking-system/internal/auth"
 	"banking-system/internal/chat"
 	"banking-system/internal/db"
@@ -90,6 +92,11 @@ func main() {
 	authService := auth.NewService(pg, tbClient, jwtSecret, jwtExpiry)
 	authHandler := auth.NewHandler(authService)
 
+	// Seed de usuarios demo (solo en development)
+	if os.Getenv("APP_ENV") == "development" {
+		seedDemoUsers(rootCtx, authService)
+	}
+
 	txnService := transactions.NewService(pg, tbClient)
 	txnHandler := transactions.NewHandler(txnService)
 
@@ -149,6 +156,11 @@ func main() {
 		r.Use(auth.RequireAuth(jwtSecret))
 		r.Post("/api/chat", chatHandler.ChatHandler)
 		r.Post("/api/chat/confirm", chatHandler.ConfirmHandler)
+	})
+
+	// Ruta de lookup de usuarios (requiere JWT)
+	r.Group(func(r chi.Router) {
+		r.Use(auth.RequireAuth(jwtSecret))
 		r.Get("/api/users/lookup", authHandler.LookupHandler)
 	})
 
@@ -156,7 +168,7 @@ func main() {
 		Addr:         ":" + port,
 		Handler:      r,
 		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 90 * time.Second, // el chat puede tardar (LLM)
+		WriteTimeout: 90 * time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
 
@@ -178,6 +190,36 @@ func main() {
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("shutdown: %v", err)
+	}
+}
+
+// seedDemoUsers crea los usuarios demo si no existen.
+//
+// Solo en APP_ENV=development. Idempotente: si el email ya existe,
+// continúa sin error.
+//
+// Usuarios creados:
+//   - demo@banco.com / Demo1234!
+//   - demo2@banco.com / Demo1234!
+//
+// Estos usuarios se crean con alias (demo, demo2) y con su cuenta
+// en TigerBeetle, igual que cualquier usuario registrado vía la API.
+func seedDemoUsers(ctx context.Context, svc *auth.Service) {
+	demos := []auth.RegisterRequest{
+		{Email: "demo@banco.com", Password: "Demo1234!", FullName: "Usuario Demo"},
+		{Email: "demo2@banco.com", Password: "Demo1234!", FullName: "Usuario Demo 2"},
+	}
+	for _, d := range demos {
+		_, err := svc.Register(ctx, d)
+		if err != nil {
+			var appErr *apperr.AppError
+			if errors.As(err, &appErr) && appErr.Code == "EMAIL_EXISTS" {
+				continue // ya existe, OK
+			}
+			log.Printf("[seed] error creando %s: %v", d.Email, err)
+			continue
+		}
+		log.Printf("[seed] usuario demo creado: %s", d.Email)
 	}
 }
 
