@@ -147,6 +147,11 @@ export default function History() {
                           <div>
                             <p className="text-sm font-medium text-gray-900">
                               {codeLabel(tx.code)}
+                              {tx.description && (
+                                <span className="text-gray-500 font-normal">
+                                  {' · '}{tx.description}
+                                </span>
+                              )}
                             </p>
                             <p className="text-xs text-gray-500">
                               {isIn ? 'Recibido' : 'Enviado'}

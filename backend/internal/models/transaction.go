@@ -7,13 +7,8 @@ import (
 
 // Códigos de transferencia (Transfer.code en TigerBeetle).
 const (
-	// TransferCodeDeposit es una transferencia banco -> usuario.
-	TransferCodeDeposit uint16 = 1
-
-	// TransferCodeWithdrawal es una transferencia usuario -> banco.
-	TransferCodeWithdrawal uint16 = 2
-
-	// TransferCodeUserTransfer es una transferencia usuario -> usuario.
+	TransferCodeDeposit      uint16 = 1
+	TransferCodeWithdrawal   uint16 = 2
 	TransferCodeUserTransfer uint16 = 3
 )
 
@@ -32,12 +27,18 @@ type Transaction struct {
 	CreditHex       string    `json:"credit_account_id"`
 	AmountCents     int64     `json:"amount_cents"`
 	Code            uint16    `json:"code"`
+	Description     string    `json:"description,omitempty"`
 	CreatedAt       time.Time `json:"created_at"`
 
 	// IdempotencyKey es la clave enviada por el cliente para garantizar
 	// idempotencia. NO se persiste en PostgreSQL. Se usa solo para
 	// generar el TBTransferID de forma determinística.
 	IdempotencyKey string `json:"-"`
+
+	// FixtureCreatedAt es opcional. Si está seteado, se usa como
+	// created_at en transactions_log en vez de NOW().
+	// Uso exclusivo del seed de fixtures.
+	FixtureCreatedAt *time.Time `json:"-"`
 }
 
 // FillHex llena los campos DebitHex y CreditHex a partir de los bytes.

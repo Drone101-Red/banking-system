@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS transactions_log (
     credit_account_id BYTEA NOT NULL,
     amount_cents      BIGINT NOT NULL,
     code              SMALLINT NOT NULL,
+    description       VARCHAR(255),
     created_at        TIMESTAMP DEFAULT NOW()
 );
 
