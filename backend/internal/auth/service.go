@@ -291,6 +291,14 @@ func generateTBAccountID() (tb.Uint128, []byte, error) {
 	}
 }
 
+// GetUserByEmailForSeed busca un usuario por email para uso interno del seed.
+//
+// Es un wrapper del método del PostgresStore. Uso exclusivo del cargador de
+// fixtures en desarrollo.
+func (s *Service) GetUserByEmailForSeed(ctx context.Context, email string) (*models.User, error) {
+	return s.pg.GetUserByEmail(ctx, strings.ToLower(strings.TrimSpace(email)))
+}
+
 // hexEncode convierte bytes a hex string.
 func hexEncode(b []byte) string {
 	const hexChars = "0123456789abcdef"

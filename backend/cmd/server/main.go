@@ -92,17 +92,25 @@ func main() {
 	authService := auth.NewService(pg, tbClient, jwtSecret, jwtExpiry)
 	authHandler := auth.NewHandler(authService)
 
-	// Seed de usuarios demo (solo en development)
-	if os.Getenv("APP_ENV") == "development" {
-		seedDemoUsers(rootCtx, authService)
-		seedFixtureUsers(rootCtx, authService, os.Getenv("TEST_DATA_FILE"), getEnvInt("TEST_DATA_LIMIT", 100))
-	}
-
 	txnService := transactions.NewService(pg, tbClient)
 	txnHandler := transactions.NewHandler(txnService)
 
 	acctService := account.NewService(pg, tbClient)
 	acctHandler := account.NewHandler(acctService)
+
+	// Seed de usuarios demo (solo en development).
+	// Se ejecuta síncronamente antes de arrancar HTTP.
+	if os.Getenv("APP_ENV") == "development" {
+		seedDemoUsers(rootCtx, authService)
+		seedFixtureUsers(
+			rootCtx,
+			authService,
+			txnService,
+			os.Getenv("TEST_DATA_FILE"),
+			getEnvInt("TEST_DATA_LIMIT", 100),
+			getEnvInt("TEST_TRANSACTION_LIMIT", 2000),
+		)
+	}
 
 	// Wiring de chat
 	openRouterClient := chat.NewOpenRouterClient(openRouterKey, openRouterModel)
@@ -198,13 +206,6 @@ func main() {
 //
 // Solo en APP_ENV=development. Idempotente: si el email ya existe,
 // continúa sin error.
-//
-// Usuarios creados:
-//   - demo@banco.com / Demo1234!
-//   - demo2@banco.com / Demo1234!
-//
-// Estos usuarios se crean con alias (demo, demo2) y con su cuenta
-// en TigerBeetle, igual que cualquier usuario registrado vía la API.
 func seedDemoUsers(ctx context.Context, svc *auth.Service) {
 	demos := []auth.RegisterRequest{
 		{Email: "demo@banco.com", Password: "Demo1234!", FullName: "Usuario Demo"},
@@ -215,63 +216,13 @@ func seedDemoUsers(ctx context.Context, svc *auth.Service) {
 		if err != nil {
 			var appErr *apperr.AppError
 			if errors.As(err, &appErr) && appErr.Code == "EMAIL_EXISTS" {
-				continue // ya existe, OK
+				continue
 			}
 			log.Printf("[seed] error creando %s: %v", d.Email, err)
 			continue
 		}
 		log.Printf("[seed] usuario demo creado: %s", d.Email)
 	}
-}
-
-type fixtureData struct {
-	Users []struct {
-		Email    string `json:"email"`
-		Password string `json:"password"`
-		FullName string `json:"full_name"`
-	} `json:"users"`
-}
-
-func seedFixtureUsers(ctx context.Context, svc *auth.Service, path string, limit int) {
-	if path == "" || limit <= 0 {
-		return
-	}
-
-	data, err := os.ReadFile(path)
-	if err != nil {
-		log.Printf("[seed] no se pudo leer fixture %s: %v", path, err)
-		return
-	}
-
-	var fixture fixtureData
-	if err := json.Unmarshal(data, &fixture); err != nil {
-		log.Printf("[seed] fixture inválido %s: %v", path, err)
-		return
-	}
-
-	if limit > len(fixture.Users) {
-		limit = len(fixture.Users)
-	}
-
-	created := 0
-	for _, user := range fixture.Users[:limit] {
-		_, err := svc.Register(ctx, auth.RegisterRequest{
-			Email:    user.Email,
-			Password: user.Password,
-			FullName: user.FullName,
-		})
-		if err != nil {
-			var appErr *apperr.AppError
-			if errors.As(err, &appErr) && appErr.Code == "EMAIL_EXISTS" {
-				continue
-			}
-			log.Printf("[seed] error creando %s: %v", user.Email, err)
-			continue
-		}
-		created++
-	}
-
-	log.Printf("[seed] fixture cargado: %d usuarios nuevos de %d", created, limit)
 }
 
 func healthHandler(pg *db.PostgresStore, tbClient *tigerbeetle.Client) http.HandlerFunc {

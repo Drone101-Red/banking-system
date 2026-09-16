@@ -69,6 +69,7 @@ services:
       OPENROUTER_MODEL: ${OPENROUTER_MODEL:-openrouter/free}
       TEST_DATA_FILE: /app/datos-prueba.json
       TEST_DATA_LIMIT: ${TEST_DATA_LIMIT:-100}
+      TEST_TRANSACTION_LIMIT: ${TEST_TRANSACTION_LIMIT:-2000}
     volumes:
       - ./datos-prueba.json:/app/datos-prueba.json:ro
     ports:

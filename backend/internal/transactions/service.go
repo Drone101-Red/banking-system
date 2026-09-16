@@ -330,3 +330,14 @@ func bytesEqual(a, b []byte) bool {
 	}
 	return true
 }
+
+// GetTBAccountIDByUserID devuelve el tb_account_id (hex) de un usuario.
+//
+// Uso interno del cargador de fixtures.
+func (s *Service) GetTBAccountIDByUserID(ctx context.Context, userID string) (string, error) {
+	user, err := s.pg.GetUserByID(ctx, userID)
+	if err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(user.TBAccountID), nil
+}
