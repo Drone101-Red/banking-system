@@ -6,6 +6,7 @@ import BalanceCard from '../components/BalanceCard';
 import { useAuth } from '../contexts/AuthContext';
 import { useBalance } from '../hooks/useBalance';
 import api from '../api/client';
+import Chat from '../components/Chat';
 
 export default function Dashboard() {
   const { user, tbAccountID } = useAuth();
@@ -165,12 +166,7 @@ export default function Dashboard() {
         {/* Columna derecha */}
         <div className="lg:col-span-2 space-y-6">
           {/* Chat (placeholder hasta Batch 4b) */}
-          <div className="card p-6">
-            <h2 className="font-semibold mb-2">Asistente bancario</h2>
-            <p className="text-sm text-gray-500">
-              Próximamente: chat con IA para hacer operaciones en lenguaje natural.
-            </p>
-          </div>
+          <Chat onBalanceChange={refreshBalance} />
 
           {/* Últimas transacciones */}
           <div className="card">
