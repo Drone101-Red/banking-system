@@ -220,13 +220,19 @@ func (s *PostgresStore) AliasExists(ctx context.Context, alias string) (bool, er
 }
 
 // --- Transactions log ---
-
-// InsertTransactionLog guarda un índice de la transferencia.
+// InsertTransactionLog guarda un índice de la transferencia para el
+// historial. La verdad financiera está en TigerBeetle.
+//
+// Es idempotente: si el tb_transfer_id ya existe (UNIQUE constraint),
+// el INSERT usa ON CONFLICT DO NOTHING.
+//
+// Si t.FixtureCreatedAt está seteado, se usa como created_at.
+// Si no, se usa NOW().
 func (s *PostgresStore) InsertTransactionLog(ctx context.Context, t *models.Transaction) error {
 	const q = `
 		INSERT INTO transactions_log
-		    (tb_transfer_id, debit_account_id, credit_account_id, amount_cents, code)
-		VALUES ($1, $2, $3, $4, $5)
+		    (tb_transfer_id, debit_account_id, credit_account_id, amount_cents, code, description, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, NOW()))
 		ON CONFLICT (tb_transfer_id) DO NOTHING
 		RETURNING id, created_at`
 
@@ -236,6 +242,8 @@ func (s *PostgresStore) InsertTransactionLog(ctx context.Context, t *models.Tran
 		t.CreditAccountID,
 		t.AmountCents,
 		t.Code,
+		t.Description,
+		t.FixtureCreatedAt,
 	).Scan(&t.ID, &t.CreatedAt)
 
 	if errors.Is(err, sql.ErrNoRows) {
@@ -243,6 +251,25 @@ func (s *PostgresStore) InsertTransactionLog(ctx context.Context, t *models.Tran
 	}
 	if err != nil {
 		return apperr.Internal(fmt.Errorf("insert transaction log: %w", err))
+	}
+	return nil
+}
+
+// UpdateTransactionLogMetadata actualiza description y created_at de una
+// fila en transactions_log.
+func (s *PostgresStore) UpdateTransactionLogMetadata(
+	ctx context.Context,
+	tbTransferID []byte,
+	description string,
+	createdAt time.Time,
+) error {
+	const q = `
+		UPDATE transactions_log
+		SET description = $1, created_at = $2
+		WHERE tb_transfer_id = $3`
+	_, err := s.db.ExecContext(ctx, q, description, createdAt, tbTransferID)
+	if err != nil {
+		return apperr.Internal(fmt.Errorf("update txlog metadata: %w", err))
 	}
 	return nil
 }
@@ -264,7 +291,7 @@ func (s *PostgresStore) ListTransactions(
 
 	const listQ = `
 		SELECT id, tb_transfer_id, debit_account_id, credit_account_id,
-		       amount_cents, code, created_at
+		       amount_cents, code, COALESCE(description, ''), created_at
 		FROM transactions_log
 		WHERE debit_account_id = $1 OR credit_account_id = $1
 		ORDER BY created_at DESC
@@ -281,7 +308,7 @@ func (s *PostgresStore) ListTransactions(
 		var t models.Transaction
 		if err := rows.Scan(
 			&t.ID, &t.TBTransferID, &t.DebitAccountID, &t.CreditAccountID,
-			&t.AmountCents, &t.Code, &t.CreatedAt,
+			&t.AmountCents, &t.Code, &t.Description, &t.CreatedAt,
 		); err != nil {
 			return nil, 0, apperr.Internal(fmt.Errorf("scan transaction: %w", err))
 		}

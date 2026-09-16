@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
 	tb "github.com/tigerbeetle/tigerbeetle-go"
 
@@ -340,4 +341,102 @@ func (s *Service) GetTBAccountIDByUserID(ctx context.Context, userID string) (st
 		return "", err
 	}
 	return hex.EncodeToString(user.TBAccountID), nil
+}
+
+// UpdateTransactionMetadata actualiza description y created_at de una
+// transacción en el log. Uso exclusivo del seed.
+func (s *Service) UpdateTransactionMetadata(
+	ctx context.Context,
+	tbTransferID []byte,
+	description string,
+	createdAt time.Time,
+) error {
+	return s.pg.UpdateTransactionLogMetadata(ctx, tbTransferID, description, createdAt)
+}
+
+// ExecuteFixtureTransaction ejecuta una transacción del seed de fixtures.
+//
+// A diferencia de Deposit/Withdraw/Transfer, este método acepta
+// `description` y `fixtureCreatedAt` para preservar los metadatos
+// originales del fixture.
+//
+// Uso exclusivo del seed en development.
+func (s *Service) ExecuteFixtureTransaction(
+	ctx context.Context,
+	kind string, // "deposit" | "withdrawal" | "transfer"
+	userID string,
+	toAccountID string, // solo para transfer
+	amountCents int64,
+	idempotencyKey string,
+	description string,
+	fixtureCreatedAt time.Time,
+) (*models.Transaction, error) {
+	if err := validateAmount(amountCents); err != nil {
+		return nil, err
+	}
+
+	src, err := s.getActiveUser(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+
+	var (
+		tx *models.Transaction
+	)
+
+	switch kind {
+	case "deposit":
+		bankID := tb.ToUint128(models.BankAccountID)
+		tx = &models.Transaction{
+			DebitAccountID:   u128ToBytes(bankID),
+			CreditAccountID:  src.TBAccountID,
+			AmountCents:      amountCents,
+			Code:             models.TransferCodeDeposit,
+			IdempotencyKey:   deriveIdempotencyKey(userID, idempotencyKey),
+			Description:      description,
+			FixtureCreatedAt: &fixtureCreatedAt,
+		}
+
+	case "withdrawal":
+		bankID := tb.ToUint128(models.BankAccountID)
+		tx = &models.Transaction{
+			DebitAccountID:   src.TBAccountID,
+			CreditAccountID:  u128ToBytes(bankID),
+			AmountCents:      amountCents,
+			Code:             models.TransferCodeWithdrawal,
+			IdempotencyKey:   deriveIdempotencyKey(userID, idempotencyKey),
+			Description:      description,
+			FixtureCreatedAt: &fixtureCreatedAt,
+		}
+
+	case "transfer":
+		toBytes, err := parseHex16(toAccountID)
+		if err != nil {
+			return nil, apperr.BadRequest("INVALID_DEST_ACCOUNT", "Identificador de cuenta destino inválido")
+		}
+		dst, err := s.pg.GetUserByTBAccountID(ctx, toBytes)
+		if err != nil {
+			return nil, err
+		}
+		if bytesEqual(src.TBAccountID, dst.TBAccountID) {
+			return nil, apperr.BadRequest("SAME_ACCOUNT", "Origen y destino no pueden ser la misma cuenta")
+		}
+		tx = &models.Transaction{
+			DebitAccountID:   src.TBAccountID,
+			CreditAccountID:  dst.TBAccountID,
+			AmountCents:      amountCents,
+			Code:             models.TransferCodeUserTransfer,
+			IdempotencyKey:   deriveIdempotencyKey(userID, idempotencyKey),
+			Description:      description,
+			FixtureCreatedAt: &fixtureCreatedAt,
+		}
+
+	default:
+		return nil, apperr.BadRequest("INVALID_KIND", "Tipo de transacción inválido")
+	}
+
+	if err := s.executeTransfer(ctx, tx); err != nil {
+		return nil, err
+	}
+	return tx, nil
 }

@@ -94,6 +94,16 @@ func seedFixtureUsers(
 	log.Printf("[seed] fixture leído: %d users, %d accounts, %d transactions",
 		len(fixture.Users), len(fixture.Accounts), len(fixture.Transactions))
 
+	// Colocar los saldos iniciales antes de cualquier transacción del fixture.
+	seedStartTime := time.Now()
+	for _, tx := range fixture.Transactions {
+		t, err := time.Parse(time.RFC3339, tx.Timestamp)
+		if err == nil && t.Before(seedStartTime) {
+			seedStartTime = t
+		}
+	}
+	seedStartTime = seedStartTime.Add(-time.Second)
+
 	// --- Fase 2: cargar usuarios ---
 	createdUsers := loadFixtureUsers(ctx, authSvc, fixture.Users, userLimit)
 	userLimitEffective := effectiveLimit(userLimit, len(fixture.Users))
@@ -123,7 +133,7 @@ func seedFixtureUsers(
 	}
 
 	// --- Fase 4: cargar saldos iniciales ---
-	loaded := loadInitialBalances(ctx, authSvc, txnSvc, fixture.Users, userAccounts, loadedUserIDs)
+	loaded := loadInitialBalances(ctx, authSvc, txnSvc, fixture.Users, userAccounts, loadedUserIDs, seedStartTime)
 	log.Printf("[seed] saldos iniciales cargados: %d", loaded)
 
 	// --- Fase 5: cargar transacciones ---
@@ -181,6 +191,7 @@ func loadInitialBalances(
 	users []fixtureUser,
 	userAccounts map[string][]fixtureAccount,
 	loadedUserIDs map[string]bool,
+	seedStartTime time.Time,
 ) int {
 	loaded := 0
 
@@ -217,13 +228,24 @@ func loadInitialBalances(
 		// Idempotency key fija por usuario
 		key := fmt.Sprintf("seed-initial-%s", pgUser.ID)
 
-		_, err = txnSvc.Deposit(ctx, pgUser.ID, totalCents, key)
+		tx, err := txnSvc.Deposit(ctx, pgUser.ID, totalCents, key)
 		if err != nil {
 			if isIdempotentError(err) {
 				continue
 			}
 			log.Printf("[seed] error depositando saldo inicial para %s: %v", u.Email, err)
 			continue
+		}
+
+		if tx != nil {
+			if err := txnSvc.UpdateTransactionMetadata(
+				ctx,
+				tx.TBTransferID,
+				"Saldo inicial",
+				seedStartTime,
+			); err != nil {
+				log.Printf("[seed] error actualizando metadata del saldo inicial: %v", err)
+			}
 		}
 		loaded++
 	}
@@ -361,40 +383,64 @@ func executeFixtureTransaction(
 		return fmt.Errorf("amount inválido")
 	}
 
+	// Parsear el timestamp del fixture
+	fixtureTime, err := time.Parse(time.RFC3339, tx.Timestamp)
+	if err != nil {
+		return fmt.Errorf("timestamp inválido %q: %w", tx.Timestamp, err)
+	}
+
 	key := deterministicTransferID(tx)
+
+	// Construir el "kind" del service
+	var (
+		kind        string
+		userID      string
+		toAccountID string
+	)
 
 	switch tx.Type {
 	case "deposit":
-		// EXTERNAL → usuario
 		if toUserID == "" {
 			return fmt.Errorf("deposit sin to_user")
 		}
-		_, err := txnSvc.Deposit(ctx, toUserID, amountCents, key)
-		return err
+		kind = "deposit"
+		userID = toUserID
 
 	case "withdrawal":
-		// usuario → EXTERNAL
 		if fromUserID == "" {
 			return fmt.Errorf("withdrawal sin from_user")
 		}
-		_, err := txnSvc.Withdraw(ctx, fromUserID, amountCents, key)
-		return err
+		kind = "withdrawal"
+		userID = fromUserID
 
 	case "transfer":
-		// usuario → usuario
 		if fromUserID == "" || toUserID == "" {
 			return fmt.Errorf("transfer sin from/to user")
 		}
+		kind = "transfer"
+		userID = fromUserID
 		// Obtener el tb_account_id del destinatario
 		toTBAccountID, err := txnSvc.GetTBAccountIDByUserID(ctx, toUserID)
 		if err != nil {
 			return fmt.Errorf("get tb_account_id de %s: %w", toUserID, err)
 		}
-		_, err = txnSvc.Transfer(ctx, fromUserID, toTBAccountID, amountCents, key)
-		return err
+		toAccountID = toTBAccountID
+
+	default:
+		return fmt.Errorf("tipo desconocido: %s", tx.Type)
 	}
 
-	return fmt.Errorf("tipo desconocido: %s", tx.Type)
+	_, err = txnSvc.ExecuteFixtureTransaction(
+		ctx,
+		kind,
+		userID,
+		toAccountID,
+		amountCents,
+		key,
+		tx.Description,
+		fixtureTime,
+	)
+	return err
 }
 
 // ============================================================================
