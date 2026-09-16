@@ -154,6 +154,8 @@ Los usuarios demo se crean automáticamente cuando el backend arranca en `APP_EN
 
 En la página de login hay un botón **"Usar credenciales demo →"** que autocompleta el formulario. `demo2` existe específicamente para probar transferencias entre usuarios.
 
+En desarrollo, Compose también importa los primeros `TEST_DATA_LIMIT` usuarios de `datos-prueba.json` usando el flujo normal de registro. El adaptador genera el hash, alias y cuenta TigerBeetle con el formato de este proyecto; las cuentas externas y transacciones del archivo original no se importan porque usan otro modelo. Para cambiar la cantidad, edita `TEST_DATA_LIMIT` en `.env` y recrea los volúmenes.
+
 ---
 
 ## Variables de entorno

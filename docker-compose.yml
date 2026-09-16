@@ -67,6 +67,10 @@ services:
       RECONCILE_INTERVAL_MINUTES: ${RECONCILE_INTERVAL_MINUTES:-5}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
       OPENROUTER_MODEL: ${OPENROUTER_MODEL:-openrouter/free}
+      TEST_DATA_FILE: /app/datos-prueba.json
+      TEST_DATA_LIMIT: ${TEST_DATA_LIMIT:-100}
+    volumes:
+      - ./datos-prueba.json:/app/datos-prueba.json:ro
     ports:
       - "8080:8080"
     networks:
