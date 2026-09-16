@@ -1,5 +1,12 @@
 # Banking System
 
+![Go](https://img.shields.io/badge/Go-1.24-00ADD8?logo=go&logoColor=white&style=flat-square)
+![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=white&style=flat-square)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-4169E1?logo=postgresql&logoColor=white&style=flat-square)
+![TigerBeetle](https://img.shields.io/badge/TigerBeetle-0.17.9-orange?style=flat-square)
+![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white&style=flat-square)
+![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
+
 Sistema de banca en línea con doble base de datos (PostgreSQL + TigerBeetle), backend en Go, frontend en React, y un asistente de IA que ejecuta operaciones financieras en lenguaje natural.
 
 > **Sobre el asistente de IA:** el sistema implementa *tool calling* estilo OpenAI sobre OpenRouter. Los tools expuestos son funcionalmente equivalentes a los que expondría un servidor MCP — la diferencia es que OpenRouter no habla MCP directamente, expone una API compatible con OpenAI. Ver [la sección de decisiones técnicas](#decisiones-técnicas) para el detalle.
@@ -27,15 +34,15 @@ La decisión más importante del sistema es usar **dos bases de datos con respon
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    FRONTEND (React + Vite)                   │
-│                    Puerto 80 (nginx)                          │
+│                    FRONTEND (React + Vite)                  │
+│                    Puerto 80 (nginx)                        │
 └──────────────────────────┬──────────────────────────────────┘
                            │ HTTP + JWT
                            ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                    BACKEND (Go 1.24 + Chi)                   │
-│                    Puerto 8080                                │
-│                                                              │
+│                    BACKEND (Go 1.24 + Chi)                  │
+│                    Puerto 8080                              │
+│                                                             │
 │  Auth · Cuentas · Transacciones · Chat IA · Lookup          │
 └──────┬────────────────────┬──────────────────────┬──────────┘
        │                    │                      │
@@ -93,7 +100,7 @@ Las cuentas de usuario tienen el flag `DebitsMustNotExceedCredits`, así que Tig
 
 ```bash
 # Clonar
-git clone https://github.com/geanmunoz/banking-system
+git clone https://github.com/Drone101-Red/banking-system
 cd banking-system
 
 # Configurar variables de entorno
@@ -437,4 +444,4 @@ banking-system/
 
 ## Autor
 
-**Gean Munoz** — [@geanmunoz](https://github.com/geanmunoz)
+**Gean Munoz** (Gen42) — [@Drone101-Red](https://github.com/Drone101-Red)
